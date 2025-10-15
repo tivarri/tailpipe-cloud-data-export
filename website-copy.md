@@ -134,7 +134,7 @@ Azure integration is currently in beta testing. We're working with select custom
 
 **To Request Access:** Contact [sales@tailpipe.ai](mailto:sales@tailpipe.ai) or your Tailpipe account manager.
 
-*Estimated General Availability: Q1 2026*
+*Estimated General Availability: Q4 2025*
 
 ---
 
