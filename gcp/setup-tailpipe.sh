@@ -58,8 +58,8 @@ SERVICE_ACCOUNT_DISPLAY_NAME="Tailpipe Cost Analytics Connector"
 TAILPIPE_PROD_DOMAIN="tailpipe.io"
 TAILPIPE_UAT_DOMAIN="tailpipe-uat.io"
 
-# Default to production unless overridden
-TAILPIPE_DOMAIN="${TAILPIPE_DOMAIN:-$TAILPIPE_PROD_DOMAIN}"
+# Default to UAT unless overridden (GCP is in beta)
+TAILPIPE_DOMAIN="${TAILPIPE_DOMAIN:-$TAILPIPE_UAT_DOMAIN}"
 
 # Options
 DRY_RUN="${DRY_RUN:-0}"
