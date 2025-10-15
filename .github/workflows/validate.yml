@@ -1,0 +1,185 @@
+name: Validate Scripts
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  shellcheck:
+    name: ShellCheck Lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run ShellCheck
+        uses: ludeeus/action-shellcheck@master
+        with:
+          scandir: '.'
+          severity: warning
+          ignore_paths: '.git .github node_modules'
+        env:
+          SHELLCHECK_OPTS: -e SC1090 -e SC1091
+
+  json-validation:
+    name: JSON Validation
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Validate JSON files
+        run: |
+          echo "Validating JSON files..."
+          find . -name "*.json" -not -path "./.git/*" -not -path "./node_modules/*" | while read -r file; do
+            echo "Checking $file"
+            if ! jq empty "$file" 2>/dev/null; then
+              echo "❌ Invalid JSON: $file"
+              exit 1
+            else
+              echo "✅ Valid: $file"
+            fi
+          done
+
+  secret-scan:
+    name: Secret Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Scan for secrets
+        run: |
+          echo "Scanning for potential secrets..."
+
+          # Check for common secret patterns
+          if grep -r -E "(aws_access_key_id|aws_secret_access_key|password|secret|api_key|private_key)" \
+            --include="*.sh" --include="*.json" --include="*.yml" --include="*.yaml" \
+            --exclude-dir=.git --exclude-dir=.github \
+            . | grep -v "# " | grep -v "^\s*#"; then
+            echo "⚠️  Warning: Potential secrets found in files above"
+            echo "Please review and ensure no actual secrets are committed"
+            exit 1
+          fi
+
+          # Check for service account keys
+          if find . -name "*-key-*.json" -not -path "./.git/*" | grep .; then
+            echo "❌ Service account key files found!"
+            echo "These should be in .gitignore"
+            exit 1
+          fi
+
+          echo "✅ No obvious secrets detected"
+
+  markdown-lint:
+    name: Markdown Lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Lint Markdown files
+        uses: actionshub/markdownlint@main
+        with:
+          filesToIgnore: "node_modules/**"
+
+  test-scripts:
+    name: Test Script Syntax
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Test Bash scripts
+        run: |
+          echo "Testing Bash script syntax..."
+          find . -name "*.sh" -not -path "./.git/*" | while read -r script; do
+            echo "Checking $script"
+            if ! bash -n "$script"; then
+              echo "❌ Syntax error in: $script"
+              exit 1
+            else
+              echo "✅ Valid syntax: $script"
+            fi
+          done
+
+  check-permissions:
+    name: Check Script Permissions
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Verify executable permissions
+        run: |
+          echo "Checking script permissions..."
+
+          # Main setup scripts should be executable
+          for script in aws/setup-tailpipe.sh azure/setup-tailpipe.sh gcp/setup-tailpipe.sh \
+                       aws/cleanup-tailpipe.sh azure/cleanup-tailpipe.sh gcp/cleanup-tailpipe.sh; do
+            if [ -f "$script" ]; then
+              if [ ! -x "$script" ]; then
+                echo "⚠️  Warning: $script is not executable"
+                echo "Run: chmod +x $script"
+              else
+                echo "✅ $script is executable"
+              fi
+            fi
+          done
+
+  yaml-validation:
+    name: YAML Validation
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Validate YAML files
+        uses: ibiqlik/action-yamllint@v3
+        with:
+          config_file: .yamllint.yml
+          file_or_dir: .
+          strict: false
+
+  dependency-check:
+    name: Check Dependencies
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check for required tools in scripts
+        run: |
+          echo "Checking script dependencies..."
+
+          # AWS scripts should check for aws cli and jq
+          if grep -q "command -v aws" aws/setup-tailpipe.sh && \
+             grep -q "command -v jq" aws/setup-tailpipe.sh; then
+            echo "✅ AWS script checks dependencies"
+          else
+            echo "⚠️  AWS script might be missing dependency checks"
+          fi
+
+          # Azure scripts should check for az cli
+          if grep -q "command -v az" azure/setup-tailpipe.sh; then
+            echo "✅ Azure script checks dependencies"
+          else
+            echo "⚠️  Azure script might be missing dependency checks"
+          fi
+
+          # GCP scripts should check for gcloud
+          if grep -q "command -v gcloud" gcp/setup-tailpipe.sh; then
+            echo "✅ GCP script checks dependencies"
+          else
+            echo "⚠️  GCP script might be missing dependency checks"
+          fi

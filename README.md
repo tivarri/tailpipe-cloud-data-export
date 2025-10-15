@@ -1,13 +1,13 @@
 # Tailpipe Cloud Data Export
 
-Automated infrastructure setup for Tailpipe cost analytics across AWS, Azure, and Google Cloud Platform.
+Automated infrastructure setup for Tailpipe carbon emissions analytics across AWS, Azure, and Google Cloud Platform.
 
 [![License](https://img.shields.io/badge/License-Proprietary-red.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-AWS%20%7C%20Azure%20%7C%20GCP-blue.svg)]()
 
 ## Overview
 
-This repository contains automated scripts and infrastructure-as-code for setting up cost data exports from major cloud providers to the Tailpipe cost analytics platform. Each cloud provider implementation includes:
+This repository contains automated scripts and infrastructure-as-code for setting up cost data exports from major cloud providers to the Tailpipe carbon emissions analytics platform. Each cloud provider implementation includes:
 
 - ✅ **Automated setup scripts** - One-command deployment
 - ✅ **Cleanup utilities** - Safe resource removal
@@ -325,4 +325,4 @@ For Tailpipe platform support:
 
 ## Acknowledgments
 
-Built with ❤️ by the Tivarri team for seamless cloud cost analytics.
+Built with ❤️ by the Tivarri team for seamless cloud carbon emissions analytics.
