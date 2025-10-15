@@ -1,0 +1,57 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "storageAccountId": {
+      "type": "string",
+      "metadata": {
+        "description": "Resource ID of the storage account where the export will be delivered."
+      }
+    },
+    "startDate": {
+      "type": "string",
+      "defaultValue": "2025-07-01",
+      "metadata": {
+        "description": "Start date for the export recurrence period in YYYY-MM-DD format."
+      }
+    }
+  },
+  "resources": [
+    {
+      "type": "Microsoft.CostManagement/exports",
+      "apiVersion": "2025-03-01",
+      "name": "TailpipeDataExport",
+      "location": "",
+      "properties": {
+        "definition": {
+          "type": "Usage",
+          "timeframe": "MonthToDate",
+          "dataset": {
+            "granularity": "Daily",
+            "configuration": {
+              "columns": []
+            }
+          }
+        },
+        "format": "Csv",
+        "compressionMode": "Gzip",
+        "dataOverwriteBehavior": "OverwritePreviousReport",
+        "schedule": {
+          "status": "Active",
+          "recurrence": "Daily",
+          "recurrencePeriod": {
+            "from": "[parameters('startDate')]",
+            "to": "2099-12-31"
+          }
+        },
+        "deliveryInfo": {
+          "destination": {
+            "resourceId": "[parameters('storageAccountId')]",
+            "container": "dataexport",
+            "rootFolderPath": "tailpipe"
+          }
+        }
+      }
+    }
+  ]
+}

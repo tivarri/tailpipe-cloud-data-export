@@ -1,0 +1,119 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "Location": {
+      "type": "string",
+      "defaultValue": "[resourceGroup().location]",
+      "metadata": {
+        "description": "Location for all resources"
+      }
+    },
+    "AppID": {
+      "type": "string",
+      "metadata": {
+        "description": "Object ID for the TailpipeConnector-Prod enterprise application"
+      }
+    },
+     "startDate": {
+      "type": "string",
+      "defaultValue": "2025-07-01",
+      "metadata": {
+        "description": "Start date for the export recurrence period in YYYY-MM-DD format."
+      }
+    }
+  },
+  "variables": {
+    "subscriptionId": "[subscription().subscriptionId]",
+    "subIdPrefix": "[substring(subscription().subscriptionId, 0, 6)]",
+    "storageAccountName": "[toLower(concat('ta1lpipedataexport', substring(subscription().subscriptionId, 0, 6)))]"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.Storage/storageAccounts",
+      "apiVersion": "2023-01-01",
+      "name": "[variables('storageAccountName')]",
+      "location": "[parameters('Location')]",
+      "sku": {
+        "name": "Standard_LRS"
+      },
+      "kind": "StorageV2",
+      "properties": {
+        "accessTier": "Hot"
+      }
+    },
+    {
+      "type": "Microsoft.Storage/storageAccounts/blobServices/containers",
+      "apiVersion": "2023-01-01",
+      "name": "[format('{0}/default/dataexport', variables('storageAccountName'))]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName'))]"
+      ],
+      "properties": {}
+    },
+    {
+      "type": "Microsoft.Authorization/roleAssignments",
+      "apiVersion": "2022-04-01",
+      "dependsOn": [
+        "[resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName'))]"
+      ],
+      "name": "[guid(resourceGroup().id)]",
+      "scope": "[concat('Microsoft.Storage/storageAccounts', '/', variables('storageAccountName'))]",
+      "properties": {
+        "roleDefinitionId": "[concat('/subscriptions/','subscription().subscriptionId','/providers/Microsoft.Authorization/roleDefinitions/','2a2b9908-6ea1-4ae2-8e65-a410df84e7d1')]",
+        "principalId": "[parameters('AppID')]",
+        "principalType": "ServicePrincipal"
+      }
+    },
+    {
+      "type": "Microsoft.CostManagement/exports",
+      "apiVersion": "2025-03-01",
+      "name": "Ta1lpipeDataExport",
+      "dependsOn": [
+        "[resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName'))]",
+        "[resourceId('Microsoft.Storage/storageAccounts/blobServices/containers', variables('storageAccountName'), 'default', 'dataexport')]"
+      ],
+      "location": "[parameters('Location')]",
+      "properties": {
+        "definition": {
+          "type": "Usage",
+          "timeframe": "MonthToDate",
+          "dataset": {
+            "granularity": "Daily",
+            "configuration": {
+              "columns": []
+            }
+          }
+        },
+        "format": "Csv",
+        "compressionMode": "Gzip",
+        "dataOverwriteBehavior": "OverwritePreviousReport",
+        "schedule": {
+          "status": "Active",
+          "recurrence": "Daily",
+          "recurrencePeriod": {
+            "from": "[parameters('startDate')]",
+            "to": "2099-12-31"
+          }
+        },
+        "deliveryInfo": {
+          "destination": {
+                        "resourceId": "[resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName'))]",
+            "container": "dataexport",
+            "rootFolderPath": "tailpipe"
+          }
+        }
+      }
+    }
+  ],
+  "outputs": {
+    "storageAccountName": {
+      "type": "string",
+      "value": "[variables('storageAccountName')]"
+    },
+    "storageContainerName": {
+      "type": "string",
+      "value": "dataexport"
+    }
+  }
+}

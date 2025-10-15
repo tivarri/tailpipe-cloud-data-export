@@ -1,0 +1,123 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+._*
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+.AppleDB
+.AppleDesktop
+Network Trash Folder
+Temporary Items
+.apdisk
+
+# Credentials and sensitive files
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+*-key-*.json
+*credentials*.json
+*service-account*.json
+tailpipe-gcp-key-*.json
+known_subscriptions.json
+.env
+.env.local
+secrets.yaml
+secrets.json
+
+# Terraform
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.lock.hcl
+terraform.tfvars
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Azure
+.azure/
+.azureauth
+azure-credentials.json
+
+# AWS
+.aws/credentials
+aws-credentials.json
+
+# Logs
+*.log
+logs/
+*.log.*
+
+# IDE and editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+.buildpath
+
+# Claude Code
+.claude/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.bak
+*.backup
+*-backup.*
+
+# Output files
+output.txt
+output.json
+*.output
+
+# Archives
+*.zip
+*.tar.gz
+*.tar
+*.rar
+
+# Documentation that may contain sensitive info
+*-export-config.json
+*-config-output.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+venv/
+env/
+ENV/
+
+# Node.js
+node_modules/
+npm-debug.log
+yarn-debug.log
+yarn-error.log
+
+# Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Version tracking exclusions (keep versioned docs)
+!README*.md
+!SUMMARY.md
+!LICENSE
