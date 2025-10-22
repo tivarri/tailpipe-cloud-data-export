@@ -319,10 +319,6 @@ This software is proprietary and confidential. Unauthorized copying, distributio
 ## Support
 
 For Tailpipe platform support:
-- 📧 Email: support@tailpipe.io
-- 📖 Documentation: https://docs.tailpipe.io
-- 🌐 Website: https://tailpipe.io
-
-## Acknowledgments
-
-Built with ❤️ by the Tivarri team for seamless cloud carbon emissions analytics.
+- 📧 Email: support@tailpipe.ai
+- 📖 Methodology: https://tailpipe.ai/methodology
+- 🌐 Website: https://tailpipe.ai
