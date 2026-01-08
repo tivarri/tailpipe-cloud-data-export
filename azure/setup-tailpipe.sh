@@ -1133,204 +1133,419 @@ if [ "$CSP_COUNT" -gt 0 ] && [ "${SKIP_AUTOMATION:-0}" = "0" ] && [ "${SKIP_POLI
   # Deploy Azure Policy for auto-export
   log_info "Deploying Azure Policy for automatic export creation..."
 
-  POLICY_FILE="$(dirname "$0")/Automation/policy-auto-export.json"
-  if [ ! -f "$POLICY_FILE" ]; then
-    log_warning "Policy definition file not found, skipping policy deployment"
+  # Determine scope
+  if [ -z "$MANAGEMENT_GROUP_ID" ]; then
+    SCOPE_TYPE="subscription"
+    SCOPE="/subscriptions/$HOST_SUBID"
+    SCOPE_PARAM="--subscription $HOST_SUBID"
+    log_info "Deploying policy at subscription scope"
   else
-    # Determine scope
-    if [ -z "$MANAGEMENT_GROUP_ID" ]; then
-      SCOPE_TYPE="subscription"
-      SCOPE="/subscriptions/$HOST_SUBID"
-      SCOPE_PARAM="--subscription $HOST_SUBID"
-      log_info "Deploying policy at subscription scope"
-    else
-      SCOPE_TYPE="managementGroup"
-      SCOPE="/providers/Microsoft.Management/managementGroups/$MANAGEMENT_GROUP_ID"
-      SCOPE_PARAM="--management-group $MANAGEMENT_GROUP_ID"
-      log_info "Deploying policy at management group scope"
-    fi
+    SCOPE_TYPE="managementGroup"
+    SCOPE="/providers/Microsoft.Management/managementGroups/$MANAGEMENT_GROUP_ID"
+    SCOPE_PARAM="--management-group $MANAGEMENT_GROUP_ID"
+    log_info "Deploying policy at management group scope"
+  fi
 
-    # Create policy definition
-    TEMP_RULE_FILE=$(mktemp)
-    if jq -e '.properties.policyRule' "$POLICY_FILE" > /dev/null 2>&1; then
-      jq '.properties.policyRule' "$POLICY_FILE" > "$TEMP_RULE_FILE"
-      PARAMS_JSON=$(jq '.properties.parameters' "$POLICY_FILE")
-    else
-      cp "$POLICY_FILE" "$TEMP_RULE_FILE"
-      PARAMS_JSON=$(jq '.parameters' "$POLICY_FILE" 2>/dev/null || echo '{}')
-    fi
+  # Generate policy rule file at runtime (embedded to avoid external file dependency)
+  TEMP_RULE_FILE=$(mktemp)
+  cat > "$TEMP_RULE_FILE" <<'POLICY_RULE_EOF'
+{
+  "if": {
+    "field": "type",
+    "equals": "Microsoft.Resources/subscriptions"
+  },
+  "then": {
+    "effect": "[parameters('effect')]",
+    "details": {
+      "type": "Microsoft.CostManagement/exports",
+      "name": "[concat(parameters('exportNamePrefix'), '-', substring(subscription().subscriptionId, sub(length(subscription().subscriptionId), 6), 6))]",
+      "deploymentScope": "subscription",
+      "existenceScope": "subscription",
+      "roleDefinitionIds": [
+        "/providers/Microsoft.Authorization/roleDefinitions/b24988ac-6180-42a0-ab88-20f7382dd24c"
+      ],
+      "existenceCondition": {
+        "allOf": [
+          {
+            "field": "Microsoft.CostManagement/exports/schedule.status",
+            "equals": "Active"
+          },
+          {
+            "field": "Microsoft.CostManagement/exports/deliveryInfo.destination.resourceId",
+            "equals": "[parameters('storageAccountResourceId')]"
+          }
+        ]
+      },
+      "deployment": {
+        "location": "[parameters('deploymentLocation')]",
+        "properties": {
+          "mode": "Incremental",
+          "parameters": {
+            "storageAccountResourceId": {
+              "value": "[parameters('storageAccountResourceId')]"
+            },
+            "storageContainerName": {
+              "value": "[parameters('storageContainerName')]"
+            },
+            "exportNamePrefix": {
+              "value": "[parameters('exportNamePrefix')]"
+            },
+            "exportFolderPrefix": {
+              "value": "[parameters('exportFolderPrefix')]"
+            },
+            "subscriptionId": {
+              "value": "[subscription().subscriptionId]"
+            }
+          },
+          "template": {
+            "$schema": "https://schema.management.azure.com/schemas/2018-05-01/subscriptionDeploymentTemplate.json#",
+            "contentVersion": "1.0.0.0",
+            "parameters": {
+              "storageAccountResourceId": {
+                "type": "string"
+              },
+              "storageContainerName": {
+                "type": "string"
+              },
+              "exportNamePrefix": {
+                "type": "string"
+              },
+              "exportFolderPrefix": {
+                "type": "string"
+              },
+              "subscriptionId": {
+                "type": "string"
+              },
+              "startDate": {
+                "type": "string",
+                "defaultValue": "[utcNow('yyyy-MM-dd')]"
+              }
+            },
+            "variables": {
+              "exportName": "[concat(parameters('exportNamePrefix'), '-', substring(parameters('subscriptionId'), sub(length(parameters('subscriptionId')), 6), 6))]",
+              "rootFolderPath": "[concat(parameters('exportFolderPrefix'), '/subscriptions/', parameters('subscriptionId'))]",
+              "endDate": "2099-12-31"
+            },
+            "resources": [
+              {
+                "type": "Microsoft.CostManagement/exports",
+                "apiVersion": "2023-08-01",
+                "name": "[variables('exportName')]",
+                "properties": {
+                  "schedule": {
+                    "status": "Active",
+                    "recurrence": "Daily",
+                    "recurrencePeriod": {
+                      "from": "[concat(parameters('startDate'), 'T00:00:00Z')]",
+                      "to": "[concat(variables('endDate'), 'T00:00:00Z')]"
+                    }
+                  },
+                  "format": "Csv",
+                  "deliveryInfo": {
+                    "destination": {
+                      "resourceId": "[parameters('storageAccountResourceId')]",
+                      "container": "[parameters('storageContainerName')]",
+                      "rootFolderPath": "[variables('rootFolderPath')]",
+                      "type": "AzureBlob"
+                    }
+                  },
+                  "definition": {
+                    "type": "ActualCost",
+                    "timeframe": "MonthToDate",
+                    "dataSet": {
+                      "granularity": "Daily"
+                    }
+                  }
+                }
+              }
+            ],
+            "outputs": {
+              "exportName": {
+                "type": "string",
+                "value": "[variables('exportName')]"
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+POLICY_RULE_EOF
 
-    execute az policy definition create \
-      --name "$POLICY_NAME" \
-      --display-name "Deploy Cost Management Export for Subscriptions" \
-      --description "Automatically creates Cost Management exports for subscriptions" \
-      --rules "$TEMP_RULE_FILE" \
-      --params "$PARAMS_JSON" \
-      --mode All \
-      $SCOPE_PARAM >/dev/null || log_warning "Policy definition already exists or failed to create"
+  # Policy parameters (inline JSON)
+  PARAMS_JSON='{
+    "storageAccountResourceId": {
+      "type": "String",
+      "metadata": {
+        "displayName": "Storage Account Resource ID",
+        "description": "The full resource ID of the storage account where exports will be written"
+      }
+    },
+    "storageContainerName": {
+      "type": "String",
+      "metadata": {
+        "displayName": "Storage Container Name",
+        "description": "The blob container name for exports"
+      },
+      "defaultValue": "dataexport"
+    },
+    "exportNamePrefix": {
+      "type": "String",
+      "metadata": {
+        "displayName": "Export Name Prefix",
+        "description": "Prefix for the export name (will append subscription ID suffix)"
+      },
+      "defaultValue": "TailpipeDataExport"
+    },
+    "exportFolderPrefix": {
+      "type": "String",
+      "metadata": {
+        "displayName": "Export Folder Prefix",
+        "description": "Root folder path prefix in storage"
+      },
+      "defaultValue": "tailpipe"
+    },
+    "deploymentLocation": {
+      "type": "String",
+      "metadata": {
+        "displayName": "Deployment Location",
+        "description": "Azure region for the ARM deployment"
+      },
+      "defaultValue": "uksouth"
+    },
+    "effect": {
+      "type": "String",
+      "metadata": {
+        "displayName": "Effect",
+        "description": "Enable or disable the execution of the policy"
+      },
+      "allowedValues": [
+        "DeployIfNotExists",
+        "AuditIfNotExists",
+        "Disabled"
+      ],
+      "defaultValue": "DeployIfNotExists"
+    }
+  }'
 
-    rm -f "$TEMP_RULE_FILE"
+  execute az policy definition create \
+    --name "$POLICY_NAME" \
+    --display-name "Deploy Cost Management Export for Subscriptions" \
+    --description "Automatically creates Cost Management exports for subscriptions" \
+    --rules "$TEMP_RULE_FILE" \
+    --params "$PARAMS_JSON" \
+    --mode All \
+    $SCOPE_PARAM >/dev/null || log_warning "Policy definition already exists or failed to create"
 
-    # Create policy assignment
-    if [ -z "$MANAGEMENT_GROUP_ID" ]; then
-      POLICY_ID="/subscriptions/$HOST_SUBID/providers/Microsoft.Authorization/policyDefinitions/$POLICY_NAME"
-    else
-      POLICY_ID="/providers/Microsoft.Management/managementGroups/$MANAGEMENT_GROUP_ID/providers/Microsoft.Authorization/policyDefinitions/$POLICY_NAME"
-    fi
+  rm -f "$TEMP_RULE_FILE"
 
-    ASSIGNMENT_ID=$(execute az policy assignment create \
-      --name "$POLICY_ASSIGNMENT_NAME" \
-      --display-name "Auto-deploy Cost Exports" \
-      --policy "$POLICY_ID" \
-      --scope "$SCOPE" \
-      --location "$LOCATION" \
-      --mi-system-assigned \
-      --identity-scope "$SCOPE" \
-      --role Contributor \
-      --params "{
-        \"storageAccountResourceId\": {\"value\": \"/subscriptions/$HOST_SUBID/resourceGroups/$RESOURCE_GROUP/providers/Microsoft.Storage/storageAccounts/$STORAGE_ACCOUNT_NAME\"},
-        \"storageContainerName\": {\"value\": \"$STORAGE_CONTAINER\"},
-        \"exportNamePrefix\": {\"value\": \"$EXPORT_NAME_PREFIX\"},
-        \"exportFolderPrefix\": {\"value\": \"$EXPORT_FOLDER_PREFIX\"},
-        \"deploymentLocation\": {\"value\": \"$LOCATION\"},
-        \"effect\": {\"value\": \"DeployIfNotExists\"}
-      }" \
-      --query 'id' -o tsv 2>/dev/null || echo "")
+  # Create policy assignment
+  if [ -z "$MANAGEMENT_GROUP_ID" ]; then
+    POLICY_ID="/subscriptions/$HOST_SUBID/providers/Microsoft.Authorization/policyDefinitions/$POLICY_NAME"
+  else
+    POLICY_ID="/providers/Microsoft.Management/managementGroups/$MANAGEMENT_GROUP_ID/providers/Microsoft.Authorization/policyDefinitions/$POLICY_NAME"
+  fi
 
-    if [ -n "$ASSIGNMENT_ID" ]; then
-      log_success "Policy assigned"
+  ASSIGNMENT_ID=$(execute az policy assignment create \
+    --name "$POLICY_ASSIGNMENT_NAME" \
+    --display-name "Auto-deploy Cost Exports" \
+    --policy "$POLICY_ID" \
+    --scope "$SCOPE" \
+    --location "$LOCATION" \
+    --mi-system-assigned \
+    --identity-scope "$SCOPE" \
+    --role Contributor \
+    --params "{
+      \"storageAccountResourceId\": {\"value\": \"/subscriptions/$HOST_SUBID/resourceGroups/$RESOURCE_GROUP/providers/Microsoft.Storage/storageAccounts/$STORAGE_ACCOUNT_NAME\"},
+      \"storageContainerName\": {\"value\": \"$STORAGE_CONTAINER\"},
+      \"exportNamePrefix\": {\"value\": \"$EXPORT_NAME_PREFIX\"},
+      \"exportFolderPrefix\": {\"value\": \"$EXPORT_FOLDER_PREFIX\"},
+      \"deploymentLocation\": {\"value\": \"$LOCATION\"},
+      \"effect\": {\"value\": \"DeployIfNotExists\"}
+    }" \
+    --query 'id' -o tsv 2>/dev/null || echo "")
 
-      # Grant permissions to policy managed identity
-      if [ "$DRY_RUN" = "0" ]; then
-        sleep 5  # Wait for identity to be created
-        POLICY_PRINCIPAL_ID=$(az policy assignment show --name "$POLICY_ASSIGNMENT_NAME" --scope "$SCOPE" --query 'identity.principalId' -o tsv 2>/dev/null || echo "")
+  if [ -n "$ASSIGNMENT_ID" ]; then
+    log_success "Policy assigned"
 
-        if [ -n "$POLICY_PRINCIPAL_ID" ]; then
-          log_info "Granting permissions to policy managed identity..."
-          STORAGE_SUB_ID=$(echo "$STORAGE_SCOPE" | cut -d'/' -f3)
+    # Grant permissions to policy managed identity
+    if [ "$DRY_RUN" = "0" ]; then
+      sleep 5  # Wait for identity to be created
+      POLICY_PRINCIPAL_ID=$(az policy assignment show --name "$POLICY_ASSIGNMENT_NAME" --scope "$SCOPE" --query 'identity.principalId' -o tsv 2>/dev/null || echo "")
 
-          create_role_assignment "$POLICY_PRINCIPAL_ID" "Reader" "/subscriptions/$STORAGE_SUB_ID" "Policy MI: Reader on storage subscription" || true
-          create_role_assignment "$POLICY_PRINCIPAL_ID" "Storage Blob Data Contributor" "$STORAGE_SCOPE" "Policy MI: Storage Blob Data Contributor" || true
-        fi
+      if [ -n "$POLICY_PRINCIPAL_ID" ]; then
+        log_info "Granting permissions to policy managed identity..."
+        STORAGE_SUB_ID=$(echo "$STORAGE_SCOPE" | cut -d'/' -f3)
+
+        create_role_assignment "$POLICY_PRINCIPAL_ID" "Reader" "/subscriptions/$STORAGE_SUB_ID" "Policy MI: Reader on storage subscription" || true
+        create_role_assignment "$POLICY_PRINCIPAL_ID" "Storage Blob Data Contributor" "$STORAGE_SCOPE" "Policy MI: Storage Blob Data Contributor" || true
       fi
-
-      # Create remediation task
-      log_info "Creating remediation task for existing subscriptions..."
-      REMEDIATION_NAME="remediate-cost-exports-$(date +%s)"
-
-      if [ -z "$MANAGEMENT_GROUP_ID" ]; then
-        execute az policy remediation create \
-          --name "$REMEDIATION_NAME" \
-          --policy-assignment "$ASSIGNMENT_ID" \
-          --subscription "$HOST_SUBID" \
-          --resource-discovery-mode ReEvaluateCompliance >/dev/null || log_warning "Failed to create remediation task"
-      else
-        execute az policy remediation create \
-          --name "$REMEDIATION_NAME" \
-          --policy-assignment "$ASSIGNMENT_ID" \
-          --management-group "$MANAGEMENT_GROUP_ID" \
-          --resource-discovery-mode ExistingNonCompliant >/dev/null || log_warning "Failed to create remediation task"
-      fi
-
-      log_success "Policy remediation task created"
-    else
-      log_warning "Policy assignment failed or already exists"
     fi
+
+    # Create remediation task
+    log_info "Creating remediation task for existing subscriptions..."
+    REMEDIATION_NAME="remediate-cost-exports-$(date +%s)"
+
+    if [ -z "$MANAGEMENT_GROUP_ID" ]; then
+      execute az policy remediation create \
+        --name "$REMEDIATION_NAME" \
+        --policy-assignment "$ASSIGNMENT_ID" \
+        --subscription "$HOST_SUBID" \
+        --resource-discovery-mode ReEvaluateCompliance >/dev/null || log_warning "Failed to create remediation task"
+    else
+      execute az policy remediation create \
+        --name "$REMEDIATION_NAME" \
+        --policy-assignment "$ASSIGNMENT_ID" \
+        --management-group "$MANAGEMENT_GROUP_ID" \
+        --resource-discovery-mode ExistingNonCompliant >/dev/null || log_warning "Failed to create remediation task"
+    fi
+
+    log_success "Policy remediation task created"
+  else
+    log_warning "Policy assignment failed or already exists"
   fi
 
   # Setup Automation Account for provider registration
   log_info "Setting up Automation Account for provider registration..."
 
-  RUNBOOK_FILE="$(dirname "$0")/Automation/RegisterProvidersRunbook.ps1"
-  if [ ! -f "$RUNBOOK_FILE" ]; then
-    log_warning "Runbook file not found, skipping Automation Account setup"
-  else
-    # Create resource group
-    execute az group create \
-      --name "$AUTOMATION_RG" \
+  # Create resource group
+  execute az group create \
+    --name "$AUTOMATION_RG" \
+    --location "$LOCATION" \
+    --only-show-errors $DEBUG_FLAG >/dev/null
+
+  # Create automation account
+  if ! az automation account show --name "$AUTOMATION_ACCOUNT" --resource-group "$AUTOMATION_RG" &>/dev/null; then
+    log_info "Creating Automation Account..."
+    execute az automation account create \
+      --name "$AUTOMATION_ACCOUNT" \
+      --resource-group "$AUTOMATION_RG" \
       --location "$LOCATION" \
-      --only-show-errors $DEBUG_FLAG >/dev/null
+      --sku Basic \
+      --only-show-errors >/dev/null
 
-    # Create automation account
-    if ! az automation account show --name "$AUTOMATION_ACCOUNT" --resource-group "$AUTOMATION_RG" &>/dev/null; then
-      log_info "Creating Automation Account..."
-      execute az automation account create \
-        --name "$AUTOMATION_ACCOUNT" \
-        --resource-group "$AUTOMATION_RG" \
-        --location "$LOCATION" \
-        --sku Basic \
-        --only-show-errors >/dev/null
+    # Enable managed identity
+    execute az resource update \
+      --resource-group "$AUTOMATION_RG" \
+      --name "$AUTOMATION_ACCOUNT" \
+      --resource-type "Microsoft.Automation/automationAccounts" \
+      --set identity.type="SystemAssigned" >/dev/null
 
-      # Enable managed identity
-      execute az resource update \
-        --resource-group "$AUTOMATION_RG" \
-        --name "$AUTOMATION_ACCOUNT" \
-        --resource-type "Microsoft.Automation/automationAccounts" \
-        --set identity.type="SystemAssigned" >/dev/null
+    sleep 10
+    log_success "Automation Account created"
+  else
+    log_info "Automation Account already exists"
+  fi
 
-      sleep 10
-      log_success "Automation Account created"
+  # Generate runbook content at runtime (embedded to avoid external file dependency)
+  RUNBOOK_FILE=$(mktemp)
+  cat > "$RUNBOOK_FILE" <<'RUNBOOK_EOF'
+param()
+
+$ErrorActionPreference = 'Stop'
+
+# Connect with managed identity
+Connect-AzAccount -Identity | Out-Null
+
+# Get all subscriptions in the tenant
+$subscriptions = Get-AzSubscription
+
+$providersToRegister = @(
+    'Microsoft.CostManagement',
+    'Microsoft.PolicyInsights',
+    'Microsoft.CostManagementExports'
+)
+
+foreach ($sub in $subscriptions) {
+    Write-Output "Processing subscription: $($sub.Name) ($($sub.Id))"
+
+    try {
+        Set-AzContext -SubscriptionId $sub.Id -ErrorAction Stop | Out-Null
+
+        foreach ($provider in $providersToRegister) {
+            $providerStatus = Get-AzResourceProvider -ProviderNamespace $provider -ErrorAction SilentlyContinue
+
+            if (-not $providerStatus) {
+                Write-Output "  Provider $provider not found in subscription"
+                continue
+            }
+
+            if ($providerStatus.RegistrationState -ne 'Registered') {
+                Write-Output "  Registering provider: $provider (current state: $($providerStatus.RegistrationState))"
+                Register-AzResourceProvider -ProviderNamespace $provider -ErrorAction Stop | Out-Null
+            } else {
+                Write-Output "  Provider $provider already registered"
+            }
+        }
+    }
+    catch {
+        Write-Warning "  Failed to process subscription $($sub.Name): $_"
+        continue
+    }
+}
+
+Write-Output "Provider registration check complete"
+RUNBOOK_EOF
+
+  # Create and publish runbook
+  execute az automation runbook create \
+    --automation-account-name "$AUTOMATION_ACCOUNT" \
+    --resource-group "$AUTOMATION_RG" \
+    --name "$RUNBOOK_NAME" \
+    --type "PowerShell" \
+    --location "$LOCATION" 2>/dev/null || log_info "Runbook already exists"
+
+  execute az automation runbook replace-content \
+    --automation-account-name "$AUTOMATION_ACCOUNT" \
+    --resource-group "$AUTOMATION_RG" \
+    --name "$RUNBOOK_NAME" \
+    --content @"$RUNBOOK_FILE" >/dev/null
+
+  rm -f "$RUNBOOK_FILE"
+
+  execute az automation runbook publish \
+    --automation-account-name "$AUTOMATION_ACCOUNT" \
+    --resource-group "$AUTOMATION_RG" \
+    --name "$RUNBOOK_NAME" >/dev/null
+
+  log_success "Runbook published"
+
+  # Create schedule
+  if ! az automation schedule show \
+       --automation-account-name "$AUTOMATION_ACCOUNT" \
+       --resource-group "$AUTOMATION_RG" \
+       --name "DailyProviderCheck" &>/dev/null; then
+
+    # Calculate start time (10 minutes from now)
+    if date --version >/dev/null 2>&1; then
+      START_TIME=$(date -u -d '+10 minutes' '+%Y-%m-%dT%H:%M:%SZ')
     else
-      log_info "Automation Account already exists"
+      START_TIME=$(date -u -v+10M '+%Y-%m-%dT%H:%M:%SZ')
     fi
 
-    # Create and publish runbook
-    execute az automation runbook create \
+    execute az automation schedule create \
       --automation-account-name "$AUTOMATION_ACCOUNT" \
       --resource-group "$AUTOMATION_RG" \
-      --name "$RUNBOOK_NAME" \
-      --type "PowerShell" \
-      --location "$LOCATION" 2>/dev/null || log_info "Runbook already exists"
+      --name "DailyProviderCheck" \
+      --start-time "$START_TIME" \
+      --frequency "Day" \
+      --interval 1 >/dev/null
 
-    execute az automation runbook replace-content \
-      --automation-account-name "$AUTOMATION_ACCOUNT" \
+    log_success "Daily schedule created"
+  fi
+
+  # Grant permissions to automation managed identity
+  if [ "$DRY_RUN" = "0" ]; then
+    AUTO_PRINCIPAL_ID=$(az automation account show \
+      --name "$AUTOMATION_ACCOUNT" \
       --resource-group "$AUTOMATION_RG" \
-      --name "$RUNBOOK_NAME" \
-      --content @"$RUNBOOK_FILE" >/dev/null
+      --query "identity.principalId" -o tsv 2>/dev/null || echo "")
 
-    execute az automation runbook publish \
-      --automation-account-name "$AUTOMATION_ACCOUNT" \
-      --resource-group "$AUTOMATION_RG" \
-      --name "$RUNBOOK_NAME" >/dev/null
-
-    log_success "Runbook published"
-
-    # Create schedule
-    if ! az automation schedule show \
-         --automation-account-name "$AUTOMATION_ACCOUNT" \
-         --resource-group "$AUTOMATION_RG" \
-         --name "DailyProviderCheck" &>/dev/null; then
-
-      # Calculate start time (10 minutes from now)
-      if date --version >/dev/null 2>&1; then
-        START_TIME=$(date -u -d '+10 minutes' '+%Y-%m-%dT%H:%M:%SZ')
-      else
-        START_TIME=$(date -u -v+10M '+%Y-%m-%dT%H:%M:%SZ')
-      fi
-
-      execute az automation schedule create \
-        --automation-account-name "$AUTOMATION_ACCOUNT" \
-        --resource-group "$AUTOMATION_RG" \
-        --name "DailyProviderCheck" \
-        --start-time "$START_TIME" \
-        --frequency "Day" \
-        --interval 1 >/dev/null
-
-      log_success "Daily schedule created"
-    fi
-
-    # Grant permissions to automation managed identity
-    if [ "$DRY_RUN" = "0" ]; then
-      AUTO_PRINCIPAL_ID=$(az automation account show \
-        --name "$AUTOMATION_ACCOUNT" \
-        --resource-group "$AUTOMATION_RG" \
-        --query "identity.principalId" -o tsv 2>/dev/null || echo "")
-
-      if [ -n "$AUTO_PRINCIPAL_ID" ]; then
-        log_info "Granting permissions to Automation Account managed identity..."
-        create_role_assignment "$AUTO_PRINCIPAL_ID" "Reader" "/" "Automation MI: Reader at tenant root" || true
-        create_role_assignment "$AUTO_PRINCIPAL_ID" "Contributor" "/" "Automation MI: Contributor at tenant root" || true
-      fi
+    if [ -n "$AUTO_PRINCIPAL_ID" ]; then
+      log_info "Granting permissions to Automation Account managed identity..."
+      create_role_assignment "$AUTO_PRINCIPAL_ID" "Reader" "/" "Automation MI: Reader at tenant root" || true
+      create_role_assignment "$AUTO_PRINCIPAL_ID" "Contributor" "/" "Automation MI: Contributor at tenant root" || true
     fi
   fi
 
