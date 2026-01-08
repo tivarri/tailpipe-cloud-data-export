@@ -6,8 +6,17 @@
 # 1. Service Principal for Tailpipe Enterprise Application
 # 2. Resource group and storage account for cost exports
 # 3. Cost Management exports (billing-scope or subscription-scope)
+#    - Automatically detects if ActualCost export type is available
+#    - Falls back to Usage export type if ActualCost is not supported
+#    - CSP subscriptions always use Usage (ActualCost not available)
 # 4. Azure Policy for automatic export creation on new subscriptions (CSP only)
 # 5. Automation Account for provider registration (CSP only)
+#
+# Export Types:
+#   ActualCost - Shows actual costs including one-time and recurring purchases
+#                as they are incurred (preferred for financial reporting)
+#   Usage      - Shows usage-based costs with purchases amortized across
+#                their applicable time period
 #
 # Usage:
 #   ./setup-tailpipe.sh                    # Interactive mode
@@ -35,7 +44,33 @@ trap 'echo "❌ Error on line $LINENO (exit $?): see above. If you saw: The cont
 #==============================================================================
 
 # Script version
-VERSION="1.1.0"
+VERSION="1.3.0"
+
+#==============================================================================
+# API VERSION DOCUMENTATION
+#==============================================================================
+# This script uses hardcoded Azure REST API versions. These should be reviewed
+# periodically for deprecation status and updated as needed.
+#
+# API Versions Used:
+#   - Microsoft.Billing (billingAccounts): 2024-04-01
+#     Status: Current GA version
+#     Used in: Billing scope discovery (lines ~677, ~685)
+#
+#   - Microsoft.CostManagement (exports): 2025-03-01
+#     Status: Current GA version
+#     Used in: Cost export creation (lines ~735, ~816)
+#
+#   - Microsoft.Resources (subscriptions): 2020-01-01
+#     Status: Stable, widely supported
+#     Used in: Subscription quota ID lookup (line ~422)
+#
+# To check for newer API versions:
+#   az provider show --namespace Microsoft.CostManagement --query "resourceTypes[?resourceType=='exports'].apiVersions" -o tsv
+#   az provider show --namespace Microsoft.Billing --query "resourceTypes[?resourceType=='billingAccounts'].apiVersions" -o tsv
+#
+# Last reviewed: 2025-01
+#==============================================================================
 
 # Color output
 if [ -t 1 ]; then
@@ -139,7 +174,7 @@ wait_for_sp() {
   local app_id="$1"
   local sp_id=""
   local attempts=12
-  local sleep=2
+  local base_sleep=2
 
   for i in $(seq 1 $attempts); do
     # Try both resolvers
@@ -153,9 +188,13 @@ wait_for_sp() {
       return 0
     fi
 
-    log_info "Waiting for service principal to appear... ($i/$attempts)"
-    sleep $sleep
-    sleep=$(( sleep < 30 ? sleep * 2 : 30 ))
+    # Add random jitter (0-2 seconds) to prevent thundering herd
+    local jitter=$(( RANDOM % 3 ))
+    local sleep_time=$(( base_sleep + jitter ))
+
+    log_info "Waiting for service principal to appear... ($i/$attempts, sleeping ${sleep_time}s)"
+    sleep $sleep_time
+    base_sleep=$(( base_sleep < 30 ? base_sleep * 2 : 30 ))
   done
 
   return 1
@@ -199,6 +238,32 @@ create_role_assignment() {
   log_success "$description assigned"
 }
 
+retry_with_backoff() {
+  local max_attempts="${1:-3}"
+  shift
+  local attempt=1
+  local delay=2
+
+  while [ $attempt -le $max_attempts ]; do
+    if "$@"; then
+      return 0
+    fi
+
+    if [ $attempt -eq $max_attempts ]; then
+      return 1
+    fi
+
+    local jitter=$((RANDOM % 3))
+    local sleep_time=$((delay + jitter))
+    log_info "Attempt $attempt failed, retrying in ${sleep_time}s..."
+    sleep $sleep_time
+    delay=$((delay * 2))
+    [ $delay -gt 30 ] && delay=30
+    attempt=$((attempt + 1))
+  done
+  return 1
+}
+
 should_skip_subscription() {
   local sub_id="$1"
   local quota_id="$2"
@@ -218,9 +283,172 @@ should_skip_subscription() {
   return 1
 }
 
+# Check if a subscription supports ActualCost exports
+# CSP subscriptions only support Usage, not ActualCost
+is_csp_subscription() {
+  local sub_id="$1"
+  echo "$CSP_SUBS" | grep -q "$sub_id"
+}
+
+# Try to create an export, attempting ActualCost first for non-CSP subscriptions
+# Returns: 0 on success, 1 on failure
+# Outputs to stdout: the export type that was successfully created (ActualCost or Usage)
+# Sets global LAST_EXPORT_ERROR on failure
+create_export_with_type_fallback() {
+  local url="$1"
+  local payload_template="$2"  # Payload with EXPORT_TYPE_PLACEHOLDER
+  local is_csp="$3"            # 1 if CSP subscription, 0 otherwise
+  local error_output
+  error_output=$(mktemp)
+
+  local export_types=()
+
+  if [ "$is_csp" = "1" ]; then
+    # CSP subscriptions only support Usage
+    export_types=("Usage")
+  else
+    # Non-CSP subscriptions: try ActualCost first, fallback to Usage
+    export_types=("ActualCost" "Usage")
+  fi
+
+  for export_type in "${export_types[@]}"; do
+    # Create payload with current export type
+    local payload
+    payload=$(echo "$payload_template" | sed "s/EXPORT_TYPE_PLACEHOLDER/$export_type/g")
+
+    local payload_file
+    payload_file=$(mktemp)
+    echo "$payload" > "$payload_file"
+
+    # In dry run mode, just return the first export type we would try
+    if [ "$DRY_RUN" = "1" ]; then
+      echo -e "${YELLOW}[DRY RUN]${NC} az rest --method PUT --url $url --body @$payload_file --only-show-errors" >&2
+      rm -f "$payload_file" "$error_output"
+      echo "$export_type"
+      return 0
+    fi
+
+    if az rest --method PUT \
+      --url "$url" \
+      --body @"$payload_file" \
+      --only-show-errors $DEBUG_FLAG 2>"$error_output"; then
+      rm -f "$payload_file" "$error_output"
+      echo "$export_type"
+      return 0
+    fi
+
+    rm -f "$payload_file"
+
+    # Check if error is due to unsupported export type
+    local err_msg
+    err_msg=$(cat "$error_output")
+
+    # If this is ActualCost and it failed, check if we should try Usage
+    if [ "$export_type" = "ActualCost" ]; then
+      # Common error patterns for unsupported ActualCost:
+      # - "The export type 'ActualCost' is not supported"
+      # - "Invalid export type"
+      # - "ActualCost is not available"
+      if echo "$err_msg" | grep -qiE "not supported|invalid.*type|not available|ActualCost"; then
+        log_info "ActualCost not supported, trying Usage export type..."
+        continue
+      fi
+    fi
+
+    # For other errors, or if Usage also fails, report the error
+    LAST_EXPORT_ERROR="$err_msg"
+  done
+
+  rm -f "$error_output"
+  return 1
+}
+
 #==============================================================================
 # MAIN SCRIPT
 #==============================================================================
+
+# Handle --help flag
+show_help() {
+  cat <<'HELP'
+Tailpipe Azure Setup - Unified Installation Script
+
+USAGE:
+  ./setup-tailpipe.sh [OPTIONS]
+
+OPTIONS:
+  -h, --help    Show this help message and exit
+
+ENVIRONMENT VARIABLES:
+  LOCATION              Azure region (e.g., uksouth, westeurope)
+  ENTERPRISE_APP_ID     Tailpipe app ID (default: UAT)
+  MANAGEMENT_GROUP_ID   Target MG for policy deployment (auto-detected if not set)
+  BILLING_SCOPE         Billing profile ID (auto-detected if not set)
+  STORAGE_SUBID         Subscription for storage account (auto-detected if not set)
+  TENANT_ID             Target tenant ID (uses current if not set)
+  DRY_RUN               Set to 1 to preview without making changes
+  SKIP_AUTOMATION       Set to 1 to skip Automation Account setup
+  SKIP_POLICY           Set to 1 to skip Policy deployment
+  DEBUG                 Set to 1 for verbose Azure CLI output
+
+EXAMPLES:
+  Interactive mode:
+    ./setup-tailpipe.sh
+
+  Preview changes without executing:
+    DRY_RUN=1 ./setup-tailpipe.sh
+
+  Non-interactive with environment variables:
+    LOCATION=uksouth ./setup-tailpipe.sh
+
+  Skip automation components:
+    SKIP_AUTOMATION=1 SKIP_POLICY=1 ./setup-tailpipe.sh
+
+REQUIREMENTS:
+  - Azure CLI version 2.50.0 or later
+  - Logged in to Azure (az login)
+  - Appropriate permissions in target tenant
+
+For more information, see README.md
+HELP
+  exit 0
+}
+
+# Parse command line arguments
+for arg in "$@"; do
+  case $arg in
+    -h|--help)
+      show_help
+      ;;
+    -*)
+      echo -e "${YELLOW}⚠️${NC}  Unknown option: $arg (ignored)"
+      ;;
+  esac
+done
+
+# Acquire file lock to prevent concurrent execution
+LOCK_FILE="/tmp/tailpipe-azure-setup.lock"
+acquire_lock() {
+  # Try flock first (Linux), fall back to mkdir-based locking (macOS)
+  if command -v flock &>/dev/null; then
+    exec 200>"$LOCK_FILE"
+    if ! flock -n 200; then
+      return 1
+    fi
+  else
+    # macOS fallback: use mkdir as atomic lock operation
+    if ! mkdir "$LOCK_FILE.d" 2>/dev/null; then
+      return 1
+    fi
+    trap 'rmdir "$LOCK_FILE.d" 2>/dev/null' EXIT
+  fi
+  return 0
+}
+
+if ! acquire_lock; then
+  log_error "Another instance of this script is already running"
+  log_error "If you're sure no other instance is running, delete: $LOCK_FILE or $LOCK_FILE.d"
+  exit 1
+fi
 
 log_section "Tailpipe Azure Setup v$VERSION"
 
@@ -228,9 +456,71 @@ if [ "$DRY_RUN" = "1" ]; then
   log_warning "DRY RUN MODE - No changes will be made"
 fi
 
-# Show Azure CLI version
+# Show and check Azure CLI version
 AZ_VER=$(az version --query "\"azure-cli\"" -o tsv 2>/dev/null || echo "unknown")
 log_info "Azure CLI version: $AZ_VER"
+
+# Minimum required version is 2.50.0 (released June 2023)
+# Required for: proper Cost Management export support, managed identity features
+MIN_AZ_VERSION="2.50.0"
+
+check_version() {
+  local current="$1"
+  local minimum="$2"
+
+  # Handle "unknown" version
+  if [ "$current" = "unknown" ]; then
+    return 1
+  fi
+
+  # Compare versions using sort -V
+  printf '%s\n%s\n' "$minimum" "$current" | sort -V | head -n1 | grep -qx "$minimum"
+}
+
+if ! check_version "$AZ_VER" "$MIN_AZ_VERSION"; then
+  log_error "Azure CLI version $MIN_AZ_VERSION or later is required (found: $AZ_VER)"
+  log_info "Update with: brew update && brew upgrade azure-cli"
+  log_info "Or see: https://docs.microsoft.com/en-us/cli/azure/install-azure-cli"
+  exit 1
+fi
+
+# Detect Azure sovereign cloud environment
+detect_azure_cloud() {
+  # Detect Azure cloud environment from current subscription
+  local cloud_name
+  cloud_name=$(az cloud show --query name -o tsv 2>/dev/null || echo "AzureCloud")
+
+  case "$cloud_name" in
+    AzureCloud)
+      AZURE_ENVIRONMENT="public"
+      AZURE_MGMT_ENDPOINT="management.azure.com"
+      ;;
+    AzureUSGovernment)
+      AZURE_ENVIRONMENT="government"
+      AZURE_MGMT_ENDPOINT="management.usgovcloudapi.net"
+      log_warning "Azure Government cloud detected"
+      ;;
+    AzureChinaCloud)
+      AZURE_ENVIRONMENT="china"
+      AZURE_MGMT_ENDPOINT="management.chinacloudapi.cn"
+      log_warning "Azure China cloud detected"
+      ;;
+    AzureGermanCloud)
+      AZURE_ENVIRONMENT="germany"
+      AZURE_MGMT_ENDPOINT="management.microsoftazure.de"
+      log_warning "Azure Germany cloud detected (deprecated)"
+      ;;
+    *)
+      AZURE_ENVIRONMENT="unknown"
+      AZURE_MGMT_ENDPOINT="management.azure.com"
+      log_warning "Unknown Azure cloud: $cloud_name, using public endpoints"
+      ;;
+  esac
+
+  log_info "Azure environment: $AZURE_ENVIRONMENT"
+}
+
+detect_azure_cloud
 
 # Validate location
 if [ -n "${LOCATION:-}" ]; then
@@ -528,9 +818,12 @@ execute az deployment group create \
 rm -f "$TEMP_TEMPLATE"
 log_success "Storage account created: $STORAGE_ACCOUNT_NAME"
 
-# Assign RBAC - Storage Blob Data Reader
+# Assign RBAC - Storage Blob Data Reader (CRITICAL - must succeed)
 STORAGE_SCOPE="/subscriptions/$HOST_SUBID/resourceGroups/$RESOURCE_GROUP/providers/Microsoft.Storage/storageAccounts/$STORAGE_ACCOUNT_NAME"
-create_role_assignment "$SP_OBJECT_ID" "Storage Blob Data Reader" "$STORAGE_SCOPE" "Storage Blob Data Reader on storage account"
+if ! create_role_assignment "$SP_OBJECT_ID" "Storage Blob Data Reader" "$STORAGE_SCOPE" "Storage Blob Data Reader on storage account"; then
+  log_error "CRITICAL: Failed to assign Storage Blob Data Reader role. Tailpipe cannot read cost data without this permission."
+  exit 1
+fi
 
 # Assign RBAC - Monitoring Reader at Management Group or Subscription
 log_info "Assigning Monitoring Reader role..."
@@ -553,9 +846,21 @@ fi
 
 if [ "$FALLBACK_PER_SUB" = "1" ]; then
   log_info "Assigning Monitoring Reader per subscription..."
+  MONITORING_READER_SUCCESS=0
+  MONITORING_READER_FAILED=0
   for SUBID in $SUB_IDS; do
-    create_role_assignment "$SP_OBJECT_ID" "Monitoring Reader" "/subscriptions/$SUBID" "Monitoring Reader on subscription $SUBID" || true
+    if create_role_assignment "$SP_OBJECT_ID" "Monitoring Reader" "/subscriptions/$SUBID" "Monitoring Reader on subscription $SUBID"; then
+      MONITORING_READER_SUCCESS=$((MONITORING_READER_SUCCESS + 1))
+    else
+      MONITORING_READER_FAILED=$((MONITORING_READER_FAILED + 1))
+    fi
   done
+  if [ "$MONITORING_READER_SUCCESS" -eq 0 ] && [ "$MONITORING_READER_FAILED" -gt 0 ]; then
+    log_error "CRITICAL: Failed to assign Monitoring Reader role to ANY subscription. Tailpipe cannot read metrics without this permission."
+    exit 1
+  elif [ "$MONITORING_READER_FAILED" -gt 0 ]; then
+    log_warning "Monitoring Reader assigned to $MONITORING_READER_SUCCESS subscription(s), failed on $MONITORING_READER_FAILED"
+  fi
 fi
 
 log_success "Phase 1 complete: Core infrastructure deployed"
@@ -572,10 +877,12 @@ FORCE_PER_SUB_EXPORTS=0
 
 # Export tracking
 EXPORT_SUCCESS=()
+EXPORT_SUCCESS_TYPES=()  # Track export type (ActualCost or Usage) for each success
 EXPORT_FAILED=()
 EXPORT_FAILED_REASONS=()
 EXPORT_SKIPPED=()
 EXPORT_SKIPPED_REASONS=()
+BILLING_EXPORT_TYPE=""    # Track billing export type
 
 # Try to create billing-scope export for non-CSP subscriptions
 if [ -n "$NONCSP_SUBS" ]; then
@@ -610,13 +917,14 @@ if [ -n "$NONCSP_SUBS" ]; then
     BILLING_SUBFOLDER="tailpipe/billing"
     [ -n "$BP" ] && BILLING_SUBFOLDER="tailpipe/billing/$BP"
 
-    BILLING_EXPORT_PAYLOAD=$(mktemp)
-    cat > "$BILLING_EXPORT_PAYLOAD" <<JSON
+    # Create payload template with placeholder for export type
+    # Will try ActualCost first, then fallback to Usage
+    BILLING_PAYLOAD_TEMPLATE=$(cat <<JSON
 {
   "location": "$LOCATION",
   "properties": {
     "definition": {
-      "type": "Usage",
+      "type": "EXPORT_TYPE_PLACEHOLDER",
       "timeframe": "MonthToDate",
       "dataset": { "granularity": "Daily", "configuration": { "columns": [] } }
     },
@@ -638,19 +946,20 @@ if [ -n "$NONCSP_SUBS" ]; then
   }
 }
 JSON
+)
 
-    execute az rest --method PUT \
-      --url "https://management.azure.com/$BILLING_SCOPE/providers/Microsoft.CostManagement/exports/$EXPORT_NAME_BILLING?api-version=2025-03-01" \
-      --body @"$BILLING_EXPORT_PAYLOAD" \
-      --only-show-errors $DEBUG_FLAG || {
-        log_warning "Failed to create billing-scope export, will use per-subscription exports"
-        FORCE_PER_SUB_EXPORTS=1
-      }
+    BILLING_EXPORT_URL="https://management.azure.com/$BILLING_SCOPE/providers/Microsoft.CostManagement/exports/$EXPORT_NAME_BILLING?api-version=2025-03-01"
 
-    rm -f "$BILLING_EXPORT_PAYLOAD"
+    log_info "Attempting to create billing-scope export (trying ActualCost first, fallback to Usage)..."
+    LAST_EXPORT_ERROR=""
+    BILLING_EXPORT_TYPE=$(create_export_with_type_fallback "$BILLING_EXPORT_URL" "$BILLING_PAYLOAD_TEMPLATE" "0")
 
-    if [ "$FORCE_PER_SUB_EXPORTS" = "0" ]; then
-      log_success "Billing-scope export created: $EXPORT_NAME_BILLING"
+    if [ -n "$BILLING_EXPORT_TYPE" ]; then
+      log_success "Billing-scope export created: $EXPORT_NAME_BILLING (type: $BILLING_EXPORT_TYPE)"
+    else
+      log_warning "Failed to create billing-scope export, will use per-subscription exports"
+      [ -n "$LAST_EXPORT_ERROR" ] && log_info "Error: ${LAST_EXPORT_ERROR:0:100}"
+      FORCE_PER_SUB_EXPORTS=1
     fi
   fi
 fi
@@ -663,6 +972,7 @@ fi
 
 if [ -n "$PER_SUB_LIST" ]; then
   log_info "Creating subscription-scope exports..."
+  log_info "Will try ActualCost first for non-CSP subscriptions, fallback to Usage if not supported"
 
   for SUBID in $PER_SUB_LIST; do
     [ -z "$SUBID" ] && continue
@@ -683,13 +993,19 @@ if [ -n "$PER_SUB_LIST" ]; then
     EXPORT_NAME_SUB="$EXPORT_NAME_PREFIX-$SUBID_SUFFIX"
     SUB_SUBFOLDER="$EXPORT_FOLDER_PREFIX/subscriptions/$SUBID"
 
-    SUB_EXPORT_PAYLOAD=$(mktemp)
-    cat > "$SUB_EXPORT_PAYLOAD" <<JSON
+    # Determine if this is a CSP subscription
+    IS_CSP="0"
+    if is_csp_subscription "$SUBID"; then
+      IS_CSP="1"
+    fi
+
+    # Create payload template with placeholder for export type
+    SUB_PAYLOAD_TEMPLATE=$(cat <<JSON
 {
   "location": "$LOCATION",
   "properties": {
     "definition": {
-      "type": "Usage",
+      "type": "EXPORT_TYPE_PLACEHOLDER",
       "timeframe": "MonthToDate",
       "dataset": { "granularity": "Daily", "configuration": { "columns": [] } }
     },
@@ -711,42 +1027,70 @@ if [ -n "$PER_SUB_LIST" ]; then
   }
 }
 JSON
+)
 
-    ERROR_OUTPUT=$(mktemp)
-    if execute az rest --method PUT \
-      --url "https://management.azure.com/subscriptions/$SUBID/providers/Microsoft.CostManagement/exports/$EXPORT_NAME_SUB?api-version=2025-03-01" \
-      --body @"$SUB_EXPORT_PAYLOAD" \
-      --only-show-errors 2>"$ERROR_OUTPUT"; then
+    SUB_EXPORT_URL="https://management.azure.com/subscriptions/$SUBID/providers/Microsoft.CostManagement/exports/$EXPORT_NAME_SUB?api-version=2025-03-01"
+
+    LAST_EXPORT_ERROR=""
+    EXPORT_TYPE=$(create_export_with_type_fallback "$SUB_EXPORT_URL" "$SUB_PAYLOAD_TEMPLATE" "$IS_CSP")
+
+    if [ -n "$EXPORT_TYPE" ]; then
       EXPORT_SUCCESS+=("$SUBID")
-      log_success "Export created: $EXPORT_NAME_SUB (subscription: $SUBID)"
+      EXPORT_SUCCESS_TYPES+=("$EXPORT_TYPE")
+      log_success "Export created: $EXPORT_NAME_SUB (subscription: $SUBID, type: $EXPORT_TYPE)"
     else
-      ERROR_MSG=$(cat "$ERROR_OUTPUT" | head -1)
       EXPORT_FAILED+=("$SUBID")
 
-      # Parse common error types
-      if echo "$ERROR_MSG" | grep -q "RBACAccessDenied"; then
+      # Parse common error types from LAST_EXPORT_ERROR
+      if echo "$LAST_EXPORT_ERROR" | grep -q "RBACAccessDenied"; then
         EXPORT_FAILED_REASONS+=("Insufficient permissions")
-      elif echo "$ERROR_MSG" | grep -q "DisallowedProvider"; then
+      elif echo "$LAST_EXPORT_ERROR" | grep -q "DisallowedProvider"; then
         EXPORT_FAILED_REASONS+=("Cost Management provider not permitted")
-      elif echo "$ERROR_MSG" | grep -q "AuthorizationFailed"; then
+      elif echo "$LAST_EXPORT_ERROR" | grep -q "AuthorizationFailed"; then
         EXPORT_FAILED_REASONS+=("Authorization failed")
       else
-        EXPORT_FAILED_REASONS+=("${ERROR_MSG:0:80}")
+        EXPORT_FAILED_REASONS+=("${LAST_EXPORT_ERROR:0:80}")
       fi
 
       log_warning "Failed to create export for subscription: $SUBID"
     fi
-
-    rm -f "$SUB_EXPORT_PAYLOAD" "$ERROR_OUTPUT"
   done
 fi
 
 # Export creation summary
 log_section "Export Creation Summary"
-log_info "Successful exports: ${#EXPORT_SUCCESS[@]}"
+
+# Count export types
+ACTUAL_COST_COUNT=0
+USAGE_COUNT=0
+for t in "${EXPORT_SUCCESS_TYPES[@]}"; do
+  if [ "$t" = "ActualCost" ]; then
+    ACTUAL_COST_COUNT=$((ACTUAL_COST_COUNT + 1))
+  else
+    USAGE_COUNT=$((USAGE_COUNT + 1))
+  fi
+done
+
+# Add billing export to counts if it exists
+if [ -n "$BILLING_EXPORT_TYPE" ]; then
+  if [ "$BILLING_EXPORT_TYPE" = "ActualCost" ]; then
+    ACTUAL_COST_COUNT=$((ACTUAL_COST_COUNT + 1))
+  else
+    USAGE_COUNT=$((USAGE_COUNT + 1))
+  fi
+fi
+
+log_info "Successful exports: ${#EXPORT_SUCCESS[@]} subscription(s)$([ -n "$BILLING_EXPORT_TYPE" ] && echo " + 1 billing")"
+log_info "  ActualCost exports: $ACTUAL_COST_COUNT"
+log_info "  Usage exports: $USAGE_COUNT"
+
+if [ -n "$BILLING_EXPORT_TYPE" ]; then
+  log_success "  ✓ Billing scope ($BILLING_EXPORT_TYPE)"
+fi
+
 if [ "${#EXPORT_SUCCESS[@]}" -gt 0 ]; then
-  for sid in "${EXPORT_SUCCESS[@]}"; do
-    log_success "  ✓ $sid"
+  for i in "${!EXPORT_SUCCESS[@]}"; do
+    log_success "  ✓ ${EXPORT_SUCCESS[$i]} (${EXPORT_SUCCESS_TYPES[$i]})"
   done
 fi
 
@@ -848,6 +1192,7 @@ if [ "$CSP_COUNT" -gt 0 ] && [ "${SKIP_AUTOMATION:-0}" = "0" ] && [ "${SKIP_POLI
         \"storageContainerName\": {\"value\": \"$STORAGE_CONTAINER\"},
         \"exportNamePrefix\": {\"value\": \"$EXPORT_NAME_PREFIX\"},
         \"exportFolderPrefix\": {\"value\": \"$EXPORT_FOLDER_PREFIX\"},
+        \"deploymentLocation\": {\"value\": \"$LOCATION\"},
         \"effect\": {\"value\": \"DeployIfNotExists\"}
       }" \
       --query 'id' -o tsv 2>/dev/null || echo "")
@@ -1064,15 +1409,17 @@ else
   MG_ID_JSON="\"$ROOT_MG\""
 fi
 
-# Build export paths
+# Build export paths with export types
 SUB_PATHS_JSON=""
 PER_SUB_EXPORTS_JSON=""
-for sid in $PER_SUB_LIST; do
+for i in "${!EXPORT_SUCCESS[@]}"; do
+  sid="${EXPORT_SUCCESS[$i]}"
+  export_type="${EXPORT_SUCCESS_TYPES[$i]:-Usage}"
   [ -z "$sid" ] && continue
   SUB_PATHS_JSON="${SUB_PATHS_JSON:+$SUB_PATHS_JSON, }\"$EXPORT_FOLDER_PREFIX/subscriptions/$sid\""
   suffix=${sid: -6}
   name="$EXPORT_NAME_PREFIX-$suffix"
-  PER_SUB_EXPORTS_JSON="${PER_SUB_EXPORTS_JSON:+$PER_SUB_EXPORTS_JSON, }{ \"subscriptionId\": \"$sid\", \"name\": \"$name\" }"
+  PER_SUB_EXPORTS_JSON="${PER_SUB_EXPORTS_JSON:+$PER_SUB_EXPORTS_JSON, }{ \"subscriptionId\": \"$sid\", \"name\": \"$name\", \"type\": \"$export_type\" }"
 done
 [ -n "$SUB_PATHS_JSON" ] && SUB_PATHS_JSON="[$SUB_PATHS_JSON]" || SUB_PATHS_JSON="[]"
 [ -n "$PER_SUB_EXPORTS_JSON" ] && PER_SUB_EXPORTS_JSON="[$PER_SUB_EXPORTS_JSON]" || PER_SUB_EXPORTS_JSON="[]"
@@ -1080,18 +1427,22 @@ done
 # Build billing export info
 BILLING_PATH_JSON="null"
 BILLING_EXPORT_JSON="null"
-if [ -n "${BILLING_SCOPE:-}" ] && [ "$FORCE_PER_SUB_EXPORTS" = "0" ]; then
+if [ -n "${BILLING_SCOPE:-}" ] && [ -n "$BILLING_EXPORT_TYPE" ]; then
   BILLING_PATH_JSON="\"${BILLING_SUBFOLDER:-tailpipe/billing}\""
-  BILLING_EXPORT_JSON="{ \"name\": \"$EXPORT_NAME_BILLING\", \"scope\": \"$BILLING_SCOPE\" }"
+  BILLING_EXPORT_JSON="{ \"name\": \"$EXPORT_NAME_BILLING\", \"scope\": \"$BILLING_SCOPE\", \"type\": \"$BILLING_EXPORT_TYPE\" }"
 fi
 
 ACCOUNT_RESOURCE_ID="/subscriptions/$HOST_SUBID/resourceGroups/$RESOURCE_GROUP/providers/Microsoft.Storage/storageAccounts/$STORAGE_ACCOUNT_NAME"
 BLOB_ENDPOINT="https://$STORAGE_ACCOUNT_NAME.blob.core.windows.net"
 
+# Ensure proper JSON null for empty values
+TENANT_ID_JSON="null"
+[ -n "$TARGET_TENANT" ] && TENANT_ID_JSON="\"$TARGET_TENANT\""
+
 cat <<JSON_OUTPUT
 
 {
-  "tenantId": "$TARGET_TENANT",
+  "tenantId": $TENANT_ID_JSON,
   "tailpipe": {
     "appId": "$ENTERPRISE_APP_ID",
     "servicePrincipalObjectId": "$SP_OBJECT_ID"

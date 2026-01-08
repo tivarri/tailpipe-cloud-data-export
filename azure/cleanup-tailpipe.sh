@@ -26,6 +26,58 @@
 #   DEBUG           - Set to 1 for verbose output
 #
 
+#==============================================================================
+# HELP
+#==============================================================================
+
+show_help() {
+  cat <<EOF
+Tailpipe Azure Cleanup Script
+
+This script removes all Tailpipe resources from your Azure tenant:
+  - Cost Management exports (billing and subscription scopes)
+  - Azure Policy assignments and definitions
+  - Automation Account and runbooks
+  - Storage account and resource groups
+  - RBAC role assignments
+  - Service Principal (optional)
+
+Usage:
+  ./cleanup-tailpipe.sh [OPTIONS]
+
+Options:
+  -h, --help    Show this help message and exit
+
+Environment Variables:
+  DRY_RUN         Set to 1 to preview deletions without executing
+  FORCE           Set to 1 to skip all confirmations
+  KEEP_SP         Set to 1 to preserve the service principal
+  KEEP_STORAGE    Set to 1 to preserve storage account and data
+  TENANT_ID       Target tenant ID (uses current if not set)
+  DEBUG           Set to 1 for verbose output
+
+Examples:
+  ./cleanup-tailpipe.sh                    # Interactive mode
+  DRY_RUN=1 ./cleanup-tailpipe.sh          # Preview without deleting
+  FORCE=1 ./cleanup-tailpipe.sh            # Skip confirmations
+  KEEP_STORAGE=1 ./cleanup-tailpipe.sh     # Keep storage, delete exports only
+
+EOF
+  exit 0
+}
+
+# Parse command line arguments
+for arg in "$@"; do
+  case "$arg" in
+    -h|--help)
+      show_help
+      ;;
+    *)
+      echo "Warning: Unknown option ignored: $arg"
+      ;;
+  esac
+done
+
 set -Eeuo pipefail
 
 #==============================================================================
