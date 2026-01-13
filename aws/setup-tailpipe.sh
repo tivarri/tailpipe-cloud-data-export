@@ -244,12 +244,59 @@ log_info "Target region: $REGION"
 log_info "Using Tailpipe role: $TAILPIPE_ROLE_ARN"
 
 #==============================================================================
-# PHASE 1: ACCOUNT VERIFICATION
+# PHASE 1: ACCOUNT VERIFICATION & PERMISSIONS CHECK
 #==============================================================================
 
-log_section "Phase 1: Account Verification"
+log_section "Phase 1: Account Verification & Permissions Check"
 
 verify_management_account
+
+# Check required permissions before proceeding
+log_info "Checking IAM permissions..."
+
+MISSING_PERMISSIONS=()
+
+# Check S3 permissions
+if ! aws s3api list-buckets --query "Buckets[0].Name" --output text &>/dev/null; then
+  MISSING_PERMISSIONS+=("s3:ListAllMyBuckets / s3:CreateBucket")
+fi
+
+# Check bcm-data-exports permissions (the one that failed for you)
+if ! aws bcm-data-exports list-exports --max-results 1 &>/dev/null 2>&1; then
+  MISSING_PERMISSIONS+=("bcm-data-exports:ListExports / bcm-data-exports:CreateExport")
+fi
+
+# Check IAM permissions
+if ! aws iam list-roles --max-items 1 &>/dev/null; then
+  MISSING_PERMISSIONS+=("iam:ListRoles / iam:CreateRole")
+fi
+
+# Check IAM policy permissions
+if ! aws iam list-policies --scope Local --max-items 1 &>/dev/null; then
+  MISSING_PERMISSIONS+=("iam:ListPolicies / iam:PutRolePolicy")
+fi
+
+if [ ${#MISSING_PERMISSIONS[@]} -gt 0 ]; then
+  log_error "Missing required IAM permissions:"
+  echo ""
+  for perm in "${MISSING_PERMISSIONS[@]}"; do
+    log_error "  - $perm"
+  done
+  echo ""
+  log_error "The IAM user/role running this script needs the following permissions:"
+  log_error ""
+  log_error "  - s3:CreateBucket, s3:PutBucketPolicy, s3:ListAllMyBuckets"
+  log_error "  - bcm-data-exports:CreateExport, bcm-data-exports:ListExports, bcm-data-exports:GetExport"
+  log_error "  - iam:CreateRole, iam:PutRolePolicy, iam:GetRole, iam:ListRoles, iam:ListPolicies"
+  log_error ""
+  log_error "You can attach the AWS managed policy 'AdministratorAccess' temporarily,"
+  log_error "or create a custom policy with these specific permissions."
+  log_error ""
+  log_error "Current identity: $(aws sts get-caller-identity --query 'Arn' --output text 2>/dev/null || echo 'unknown')"
+  exit 1
+fi
+
+log_success "IAM permissions verified"
 
 if [ "$IS_MANAGEMENT_ACCOUNT" = "1" ]; then
   ROOT_ID=$(aws organizations list-roots --query "Roots[].Id" --output text 2>/dev/null || echo "")
