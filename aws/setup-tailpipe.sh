@@ -430,9 +430,10 @@ cat > "$EXPORT_DEF_FILE" <<EOF
 EOF
 
 if [ "$DRY_RUN" = "0" ]; then
-  # Check if export already exists
-  if aws bcm-data-exports get-export --export-arn "arn:aws:bcm-data-exports:us-east-1:${ACCOUNT_NUMBER}:export/${EXPORT_NAME}" 2>/dev/null | grep -q "ExportArn"; then
-    log_warning "Cost export already exists"
+  # Check if export already exists (export name includes a UUID suffix, so we search by prefix)
+  EXISTING_EXPORT=$(aws bcm-data-exports list-exports --query "Exports[?starts_with(ExportArn, 'arn:aws:bcm-data-exports:us-east-1:${ACCOUNT_NUMBER}:export/${EXPORT_NAME}')].ExportArn | [0]" --output text 2>/dev/null || echo "None")
+  if [ "$EXISTING_EXPORT" != "None" ] && [ -n "$EXISTING_EXPORT" ]; then
+    log_warning "Cost export already exists: $EXISTING_EXPORT"
   else
     execute aws bcm-data-exports create-export --export "file://$EXPORT_DEF_FILE" || {
       log_error "Failed to create billing data export"
@@ -727,8 +728,9 @@ if [ "$DRY_RUN" = "0" ]; then
     log_error "S3 bucket validation failed"
   fi
 
-  # Validate cost export
-  if aws bcm-data-exports get-export --export-arn "arn:aws:bcm-data-exports:us-east-1:${ACCOUNT_NUMBER}:export/${EXPORT_NAME}" 2>/dev/null | grep -q "ExportArn"; then
+  # Validate cost export (export name includes a UUID suffix, so we search by prefix)
+  EXPORT_COUNT=$(aws bcm-data-exports list-exports --query "Exports[?starts_with(ExportArn, 'arn:aws:bcm-data-exports:us-east-1:${ACCOUNT_NUMBER}:export/${EXPORT_NAME}')] | length(@)" --output text 2>/dev/null || echo "0")
+  if [ "$EXPORT_COUNT" -gt 0 ]; then
     log_success "Cost export validated"
   else
     log_warning "Cost export validation failed"

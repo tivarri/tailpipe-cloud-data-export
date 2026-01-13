@@ -227,10 +227,12 @@ log_section "Deleting Cost and Usage Report"
 
 log_info "Deleting cost export: $EXPORT_NAME"
 
-EXPORT_ARN="arn:aws:bcm-data-exports:us-east-1:${ACCOUNT_NUMBER}:export/${EXPORT_NAME}"
-
+# Export name includes a UUID suffix, so we need to search by prefix
 if [ "$DRY_RUN" = "0" ]; then
-  if aws bcm-data-exports get-export --export-arn "$EXPORT_ARN" 2>/dev/null | grep -q "ExportArn"; then
+  EXPORT_ARN=$(aws bcm-data-exports list-exports --query "Exports[?starts_with(ExportArn, 'arn:aws:bcm-data-exports:us-east-1:${ACCOUNT_NUMBER}:export/${EXPORT_NAME}')].ExportArn | [0]" --output text 2>/dev/null || echo "None")
+
+  if [ "$EXPORT_ARN" != "None" ] && [ -n "$EXPORT_ARN" ]; then
+    log_info "Found export: $EXPORT_ARN"
     execute aws bcm-data-exports delete-export --export-arn "$EXPORT_ARN" && \
       log_success "Cost export deleted" || \
       log_warning "Failed to delete cost export"
@@ -238,7 +240,7 @@ if [ "$DRY_RUN" = "0" ]; then
     log_info "Cost export not found or already deleted"
   fi
 else
-  log_info "[DRY RUN] Would delete cost export: $EXPORT_NAME"
+  log_info "[DRY RUN] Would delete cost export matching: $EXPORT_NAME*"
 fi
 
 #==============================================================================
