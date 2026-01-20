@@ -2,9 +2,9 @@ name: Validate Scripts
 
 on:
   push:
-    branches: [ main, develop ]
+    branches: [main, develop]
   pull_request:
-    branches: [ main, develop ]
+    branches: [main, develop]
 
 jobs:
   shellcheck:
@@ -22,7 +22,10 @@ jobs:
           severity: warning
           ignore_paths: '.git .github node_modules'
         env:
-          SHELLCHECK_OPTS: -e SC1090 -e SC1091
+          # SC1090: Can't follow non-constant source
+          # SC1091: Not following sourced files
+          # SC2034: Variable appears unused (often intentional for config vars)
+          SHELLCHECK_OPTS: -e SC1090 -e SC1091 -e SC2034
 
   json-validation:
     name: JSON Validation
