@@ -48,6 +48,10 @@ ROLE_NAME="tailpipe-connector-role"
 CHILD_ROLE_NAME="tailpipe-child-connector"
 STACKSET_NAME="Tailpipe-CloudWatch-Child-StackSet"
 
+# BCM Data Exports are ONLY available in us-east-1 regardless of where other
+# resources are deployed. This is an AWS limitation, not a bug.
+BCM_REGION="us-east-1"
+
 # Options
 DRY_RUN="${DRY_RUN:-0}"
 FORCE="${FORCE:-0}"
@@ -125,8 +129,37 @@ check_jq() {
 }
 
 #==============================================================================
+# EXPORT HELPER FUNCTIONS
+#==============================================================================
+
+# Sanitize a string for safe use in JMESPath queries
+# Note: hyphen must be at end to avoid being interpreted as a range
+sanitize_for_jmespath() {
+  local input="$1"
+  echo "$input" | tr -cd '[:alnum:]_-'
+}
+
+# List all Tailpipe exports (handles pagination, returns full ARNs)
+list_tailpipe_exports() {
+  local account="$1"
+  local prefix="$2"
+  local safe_account safe_prefix
+
+  safe_account=$(sanitize_for_jmespath "$account")
+  safe_prefix=$(sanitize_for_jmespath "$prefix")
+
+  aws bcm-data-exports list-exports \
+    --no-paginate \
+    --query "Exports[?starts_with(ExportArn, 'arn:aws:bcm-data-exports:${BCM_REGION}:${safe_account}:export/${safe_prefix}')].ExportArn" \
+    --output text 2>/dev/null | tr '\t' '\n' | grep -v '^$' || true
+}
+
+#==============================================================================
 # MAIN SCRIPT
 #==============================================================================
+
+# Track cleanup failures for summary
+CLEANUP_FAILURES=0
 
 log_section "Tailpipe AWS Cleanup"
 
@@ -182,13 +215,23 @@ S3_BUCKET="${S3_BUCKET_PREFIX}-${ACCOUNT_NUMBER}"
 # CONFIRMATION
 #==============================================================================
 
+# Discover actual export ARNs before showing confirmation
+EXPORT_ARNS=$(list_tailpipe_exports "$ACCOUNT_NUMBER" "$EXPORT_NAME")
+EXPORT_COUNT=$(echo "$EXPORT_ARNS" | grep -c . || echo "0")
+
 if [ "$FORCE" != "1" ]; then
   log_section "Resources to be Deleted"
 
   echo "The following resources will be removed:"
   echo ""
   echo "  📊 Cost and Usage Report:"
-  echo "     - Export: $EXPORT_NAME"
+  if [ -n "$EXPORT_ARNS" ]; then
+    echo "$EXPORT_ARNS" | while read -r arn; do
+      echo "     - $arn"
+    done
+  else
+    echo "     - (no exports found matching: $EXPORT_NAME*)"
+  fi
   echo ""
 
   if [ "$KEEP_DATA" != "1" ]; then
@@ -225,22 +268,48 @@ fi
 
 log_section "Deleting Cost and Usage Report"
 
-log_info "Deleting cost export: $EXPORT_NAME"
+log_info "Looking for exports matching: $EXPORT_NAME*"
 
-# Export name includes a UUID suffix, so we need to search by prefix
+# Re-fetch in case confirmation was skipped
+if [ -z "${EXPORT_ARNS:-}" ]; then
+  EXPORT_ARNS=$(list_tailpipe_exports "$ACCOUNT_NUMBER" "$EXPORT_NAME")
+fi
+
 if [ "$DRY_RUN" = "0" ]; then
-  EXPORT_ARN=$(aws bcm-data-exports list-exports --query "Exports[?starts_with(ExportArn, 'arn:aws:bcm-data-exports:us-east-1:${ACCOUNT_NUMBER}:export/${EXPORT_NAME}')].ExportArn | [0]" --output text 2>/dev/null || echo "None")
+  if [ -n "$EXPORT_ARNS" ]; then
+    # Delete ALL matching exports (handles duplicates from failed runs)
+    # Use process substitution to avoid subshell variable scope issues
+    DELETED_COUNT=0
+    FAILED_COUNT=0
 
-  if [ "$EXPORT_ARN" != "None" ] && [ -n "$EXPORT_ARN" ]; then
-    log_info "Found export: $EXPORT_ARN"
-    execute aws bcm-data-exports delete-export --export-arn "$EXPORT_ARN" && \
-      log_success "Cost export deleted" || \
-      log_warning "Failed to delete cost export"
+    while read -r EXPORT_ARN; do
+      [ -z "$EXPORT_ARN" ] && continue
+      log_info "Deleting export: $EXPORT_ARN"
+      if aws bcm-data-exports delete-export --export-arn "$EXPORT_ARN" 2>/dev/null; then
+        log_success "Deleted: $EXPORT_ARN"
+        DELETED_COUNT=$((DELETED_COUNT + 1))
+      else
+        log_error "Failed to delete: $EXPORT_ARN"
+        FAILED_COUNT=$((FAILED_COUNT + 1))
+        CLEANUP_FAILURES=$((CLEANUP_FAILURES + 1))
+      fi
+    done <<< "$EXPORT_ARNS"
+
+    if [ "$FAILED_COUNT" -gt 0 ]; then
+      log_warning "Some exports failed to delete - manual cleanup may be required"
+    fi
   else
-    log_info "Cost export not found or already deleted"
+    log_info "No cost exports found matching '$EXPORT_NAME*'"
   fi
 else
-  log_info "[DRY RUN] Would delete cost export matching: $EXPORT_NAME*"
+  if [ -n "$EXPORT_ARNS" ]; then
+    log_info "[DRY RUN] Would delete the following exports:"
+    echo "$EXPORT_ARNS" | while read -r arn; do
+      log_info "  - $arn"
+    done
+  else
+    log_info "[DRY RUN] No exports found matching: $EXPORT_NAME*"
+  fi
 fi
 
 #==============================================================================
@@ -449,10 +518,17 @@ if [ "$DRY_RUN" = "1" ]; then
   log_warning "DRY RUN COMPLETE - No resources were deleted"
   log_info "Run without DRY_RUN=1 to perform actual cleanup"
 else
-  log_success "Tailpipe cleanup complete!"
-  echo ""
-  log_info "Resources deleted:"
-  log_info "  ✓ Cost and Usage Report export"
+  if [ "$CLEANUP_FAILURES" -gt 0 ]; then
+    log_warning "Tailpipe cleanup completed with $CLEANUP_FAILURES failure(s)"
+    log_warning "Some resources may require manual cleanup"
+    echo ""
+    log_info "Resources processed:"
+  else
+    log_success "Tailpipe cleanup complete!"
+    echo ""
+    log_info "Resources deleted:"
+  fi
+  log_info "  ✓ Cost and Usage Report export(s)"
   [ "$KEEP_DATA" != "1" ] && log_info "  ✓ S3 bucket and data"
   [ "$KEEP_ROLE" != "1" ] && log_info "  ✓ IAM role and policies"
   [ "$IS_MANAGEMENT_ACCOUNT" = "1" ] && [ "$CHILD_COUNT" -gt 0 ] && log_info "  ✓ CloudFormation StackSets"
@@ -460,3 +536,6 @@ fi
 
 log_info ""
 log_info "Cleanup script finished"
+
+# Exit with error code if there were failures
+[ "$CLEANUP_FAILURES" -gt 0 ] && exit 1 || exit 0

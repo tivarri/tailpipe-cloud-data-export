@@ -32,7 +32,12 @@ trap 'echo "❌ Error on line $LINENO (exit $?): see above"' ERR
 #==============================================================================
 
 # Script version
-VERSION="1.0.0"
+VERSION="1.1.0"
+
+# BCM Data Exports are ONLY available in us-east-1 regardless of where other
+# resources are deployed. This is an AWS limitation, not a bug.
+# See: https://docs.aws.amazon.com/cur/latest/userguide/dataexports-create.html
+BCM_REGION="us-east-1"
 
 # Color output
 if [ -t 1 ]; then
@@ -139,6 +144,83 @@ cleanup_temp_files() {
 }
 
 trap cleanup_temp_files EXIT
+
+#==============================================================================
+# EXPORT HELPER FUNCTIONS
+#==============================================================================
+
+# Sanitize a string for safe use in JMESPath queries
+# Removes any characters that could be used for injection
+sanitize_for_jmespath() {
+  local input="$1"
+  # Only allow alphanumeric, hyphens, and underscores
+  # Note: hyphen must be at end to avoid being interpreted as a range
+  echo "$input" | tr -cd '[:alnum:]_-'
+}
+
+# List all Tailpipe exports (handles pagination, returns full ARNs)
+# Returns empty string if none found
+list_tailpipe_exports() {
+  local account="$1"
+  local prefix="$2"
+  local safe_account safe_prefix
+
+  safe_account=$(sanitize_for_jmespath "$account")
+  safe_prefix=$(sanitize_for_jmespath "$prefix")
+
+  # Use --no-paginate to get all results
+  aws bcm-data-exports list-exports \
+    --no-paginate \
+    --query "Exports[?starts_with(ExportArn, 'arn:aws:bcm-data-exports:${BCM_REGION}:${safe_account}:export/${safe_prefix}')].ExportArn" \
+    --output text 2>/dev/null | tr '\t' '\n' | grep -v '^$' || true
+}
+
+# Count Tailpipe exports matching prefix
+count_tailpipe_exports() {
+  local account="$1"
+  local prefix="$2"
+  local exports
+
+  exports=$(list_tailpipe_exports "$account" "$prefix")
+  if [ -z "$exports" ]; then
+    echo "0"
+  else
+    echo "$exports" | wc -l | tr -d ' '
+  fi
+}
+
+# Get the first Tailpipe export ARN (for cases where we expect exactly one)
+get_tailpipe_export_arn() {
+  local account="$1"
+  local prefix="$2"
+
+  list_tailpipe_exports "$account" "$prefix" | head -n1
+}
+
+# Validate export exists with retry (handles eventual consistency)
+validate_export_with_retry() {
+  local account="$1"
+  local prefix="$2"
+  local max_attempts="${3:-5}"
+  local delay="${4:-3}"
+  local attempt=1
+
+  while [ $attempt -le $max_attempts ]; do
+    local count
+    count=$(count_tailpipe_exports "$account" "$prefix")
+    if [ "$count" -gt 0 ]; then
+      return 0
+    fi
+
+    if [ $attempt -lt $max_attempts ]; then
+      log_info "Export not yet visible, retrying in ${delay}s (attempt $attempt/$max_attempts)..."
+      sleep "$delay"
+    fi
+    attempt=$((attempt + 1))
+  done
+
+  return 1
+}
 
 #==============================================================================
 # VALIDATION FUNCTIONS
@@ -429,20 +511,45 @@ cat > "$EXPORT_DEF_FILE" <<EOF
 }
 EOF
 
+# Check for existing exports (works in both DRY_RUN and normal mode)
+EXISTING_EXPORTS=$(list_tailpipe_exports "$ACCOUNT_NUMBER" "$EXPORT_NAME")
+EXISTING_COUNT=$(echo "$EXISTING_EXPORTS" | grep -c . || echo "0")
+
+if [ "$EXISTING_COUNT" -gt 1 ]; then
+  log_warning "Found $EXISTING_COUNT existing exports matching '$EXPORT_NAME':"
+  echo "$EXISTING_EXPORTS" | while read -r arn; do
+    log_warning "  - $arn"
+  done
+  log_warning "Consider cleaning up duplicate exports before proceeding"
+fi
+
 if [ "$DRY_RUN" = "0" ]; then
-  # Check if export already exists (export name includes a UUID suffix, so we search by prefix)
-  EXISTING_EXPORT=$(aws bcm-data-exports list-exports --query "Exports[?starts_with(ExportArn, 'arn:aws:bcm-data-exports:us-east-1:${ACCOUNT_NUMBER}:export/${EXPORT_NAME}')].ExportArn | [0]" --output text 2>/dev/null || echo "None")
-  if [ "$EXISTING_EXPORT" != "None" ] && [ -n "$EXISTING_EXPORT" ]; then
-    log_warning "Cost export already exists: $EXISTING_EXPORT"
+  if [ -n "$EXISTING_EXPORTS" ]; then
+    # Store the first export ARN for later use in summary
+    CREATED_EXPORT_ARN=$(echo "$EXISTING_EXPORTS" | head -n1)
+    log_warning "Cost export already exists: $CREATED_EXPORT_ARN"
   else
-    execute aws bcm-data-exports create-export --export "file://$EXPORT_DEF_FILE" || {
+    # Create the export and capture the ARN from the response
+    EXPORT_RESPONSE=$(aws bcm-data-exports create-export --export "file://$EXPORT_DEF_FILE" --output json 2>&1) || {
       log_error "Failed to create billing data export"
+      log_error "$EXPORT_RESPONSE"
       exit 1
     }
-    log_success "Billing data export created"
+    CREATED_EXPORT_ARN=$(echo "$EXPORT_RESPONSE" | jq -r '.ExportArn // empty')
+    if [ -n "$CREATED_EXPORT_ARN" ]; then
+      log_success "Billing data export created: $CREATED_EXPORT_ARN"
+    else
+      log_success "Billing data export created"
+      # Fetch the ARN since it wasn't in the response
+      CREATED_EXPORT_ARN=$(get_tailpipe_export_arn "$ACCOUNT_NUMBER" "$EXPORT_NAME")
+    fi
   fi
 else
-  log_info "[DRY RUN] Would create cost export: $EXPORT_NAME"
+  if [ -n "$EXISTING_EXPORTS" ]; then
+    log_info "[DRY RUN] Cost export already exists: $(echo "$EXISTING_EXPORTS" | head -n1)"
+  else
+    log_info "[DRY RUN] Would create cost export: $EXPORT_NAME"
+  fi
 fi
 
 #==============================================================================
@@ -728,12 +835,13 @@ if [ "$DRY_RUN" = "0" ]; then
     log_error "S3 bucket validation failed"
   fi
 
-  # Validate cost export (export name includes a UUID suffix, so we search by prefix)
-  EXPORT_COUNT=$(aws bcm-data-exports list-exports --query "Exports[?starts_with(ExportArn, 'arn:aws:bcm-data-exports:us-east-1:${ACCOUNT_NUMBER}:export/${EXPORT_NAME}')] | length(@)" --output text 2>/dev/null || echo "0")
-  if [ "$EXPORT_COUNT" -gt 0 ]; then
+  # Validate cost export with retry (handles eventual consistency)
+  # Export name includes a UUID suffix, so we search by prefix
+  if validate_export_with_retry "$ACCOUNT_NUMBER" "$EXPORT_NAME" 5 3; then
     log_success "Cost export validated"
   else
-    log_warning "Cost export validation failed"
+    log_warning "Cost export validation failed - export may still be provisioning"
+    log_warning "Check AWS Console in a few minutes: https://${BCM_REGION}.console.aws.amazon.com/costmanagement/home#/bcm-data-exports"
   fi
 
   # Validate IAM role
@@ -776,7 +884,8 @@ cat <<JSON_OUTPUT
     "name": "${EXPORT_NAME}",
     "s3Bucket": "${S3_BUCKET}",
     "s3Prefix": "${EXPORT_PREFIX}",
-    "exportArn": "arn:aws:bcm-data-exports:us-east-1:${ACCOUNT_NUMBER}:export/${EXPORT_NAME}"
+    "exportArn": "${CREATED_EXPORT_ARN:-$(get_tailpipe_export_arn "$ACCOUNT_NUMBER" "$EXPORT_NAME")}",
+    "bcmRegion": "${BCM_REGION}"
   },
   "iamRole": {
     "name": "${ROLE_NAME}",
