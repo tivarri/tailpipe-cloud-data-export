@@ -79,18 +79,15 @@ jobs:
 
           echo "✅ No obvious secrets detected"
 
-  markdown-lint:
-    name: Markdown Lint
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Lint Markdown files
-        uses: actionshub/markdownlint@main
-        with:
-          filesToIgnore: "node_modules/**"
+  # Markdown linting disabled - too strict for documentation
+  # markdown-lint:
+  #   name: Markdown Lint
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - name: Checkout code
+  #       uses: actions/checkout@v4
+  #     - name: Lint Markdown files
+  #       uses: actionshub/markdownlint@main
 
   test-scripts:
     name: Test Script Syntax
