@@ -182,7 +182,8 @@ After successful deployment, you'll receive a JSON configuration summary:
     "name": "tailpipe-dataexport",
     "s3Bucket": "tailpipe-dataexport-123456789012",
     "s3Prefix": "dataexport",
-    "exportArn": "arn:aws:bcm-data-exports:us-east-1:123456789012:export/tailpipe-dataexport"
+    "exportArn": "arn:aws:bcm-data-exports:us-east-1:123456789012:export/tailpipe-dataexport-a1b2c3d4-...",
+    "bcmRegion": "us-east-1"
   },
   "iamRole": {
     "name": "tailpipe-connector-role",
@@ -217,8 +218,9 @@ aws s3 ls s3://tailpipe-dataexport-{account-number}
 
 **Check cost export:**
 ```bash
-aws bcm-data-exports get-export \
-  --export-arn "arn:aws:bcm-data-exports:us-east-1:{account-number}:export/tailpipe-dataexport"
+# List exports matching 'tailpipe' (note: export ARN includes a UUID suffix)
+aws bcm-data-exports list-exports \
+  --query "Exports[?contains(ExportArn, 'tailpipe')]"
 ```
 
 **Check IAM role:**
@@ -414,13 +416,16 @@ aws bcm-data-exports list-exports --query 'Exports[?contains(ExportName, `tailpi
 ### Monitor Export Status
 
 ```bash
-# Check export details
-aws bcm-data-exports get-export \
-  --export-arn "arn:aws:bcm-data-exports:us-east-1:{account-number}:export/tailpipe-dataexport"
+# List Tailpipe exports (note: export ARN includes a UUID suffix)
+aws bcm-data-exports list-exports \
+  --query "Exports[?contains(ExportArn, 'tailpipe')]"
 
-# List all exports
-aws bcm-data-exports list-exports
+# Get specific export details (use the full ARN from the list above)
+aws bcm-data-exports get-export \
+  --export-arn "arn:aws:bcm-data-exports:us-east-1:{account}:export/tailpipe-dataexport-{uuid}"
 ```
+
+> **Note:** BCM Data Exports are always created in `us-east-1` regardless of the region you specify for other resources. The export ARN includes a UUID suffix that AWS generates automatically.
 
 ### Update CloudFormation StackSet
 
@@ -626,7 +631,7 @@ Check version:
 head -20 setup-tailpipe.sh | grep VERSION
 ```
 
-Current version: **1.0.0**
+Current version: **1.1.0**
 
 ### Logs
 
