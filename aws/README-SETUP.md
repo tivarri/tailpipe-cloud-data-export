@@ -83,11 +83,33 @@ All configuration can be controlled via environment variables:
 |----------|-------------|---------|---------|
 | `REGION` | AWS region for resources | _(prompt)_ | `us-east-1` |
 | `EXTERNAL_ID` | Tailpipe external ID | _(prompt)_ | `abc123...` |
-| `TAILPIPE_ROLE_ARN` | Tailpipe connector role ARN | Prod role | `arn:aws:iam::336268260260:role/TailpipeConnector-UAT` |
 | `SKIP_CHILD_ACCOUNTS` | Skip child account setup | `0` | `1` |
+| `CHILD_ACCOUNTS` | Select specific child accounts | _(interactive)_ | `all`, `123456789012,987654321098` |
 | `DRY_RUN` | Preview without changes | `0` | `1` |
 | `FORCE` | Skip confirmations | `0` | `1` |
 | `DEBUG` | Verbose AWS CLI output | `0` | `1` |
+
+### Child Account Selection
+
+For AWS Organizations with multiple accounts, you can control which child accounts get configured:
+
+**Interactive selection (default):**
+```bash
+./setup-tailpipe.sh
+# Script will display a numbered list of accounts and prompt for selection
+```
+
+**Configure all accounts:**
+```bash
+CHILD_ACCOUNTS=all ./setup-tailpipe.sh
+```
+
+**Configure specific accounts only:**
+```bash
+CHILD_ACCOUNTS="111111111111,222222222222,333333333333" ./setup-tailpipe.sh
+```
+
+> **Note:** When configuring specific accounts, auto-deployment is disabled so new accounts joining the organization won't be automatically configured. Run the script again to add new accounts.
 
 ### Examples
 
@@ -648,37 +670,6 @@ DEBUG=1 ./setup-tailpipe.sh 2>&1 | tee setup-tailpipe.log
 - [AWS Organizations](https://docs.aws.amazon.com/organizations/latest/userguide/orgs_introduction.html)
 - [CloudFormation StackSets](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/what-is-cfnstacksets.html)
 - [IAM Roles and External IDs](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_create_for-user_externalid.html)
-
-## Comparison with Original Script
-
-### Improvements
-
-| Feature | Original | New Version |
-|---------|----------|-------------|
-| Dry-run mode | ❌ | ✅ |
-| Non-interactive | ❌ | ✅ |
-| Colored output | ⚠️ Partial | ✅ Full |
-| Validation | ❌ | ✅ |
-| Cleanup script | ❌ | ✅ |
-| Config output | ❌ | ✅ JSON |
-| Error handling | ⚠️ Basic | ✅ Comprehensive |
-| Documentation | ⚠️ Minimal | ✅ Complete |
-| CI/CD ready | ❌ | ✅ |
-| Version tracking | ❌ | ✅ |
-
-### Migration
-
-If you used the original script, the new version is compatible:
-
-```bash
-# Cleanup old resources (if needed)
-./cleanup-tailpipe.sh
-
-# Deploy with new script
-./setup-tailpipe.sh
-```
-
-Or run the new script - it will detect existing resources and skip creation.
 
 ## License
 

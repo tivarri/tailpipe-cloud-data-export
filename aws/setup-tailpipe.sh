@@ -17,7 +17,6 @@
 # Environment Variables:
 #   REGION              - AWS region (e.g., us-east-1, eu-west-1)
 #   EXTERNAL_ID         - Tailpipe external ID (provided by Tailpipe)
-#   TAILPIPE_ROLE_ARN   - Tailpipe connector role ARN (default: prod)
 #   SKIP_CHILD_ACCOUNTS - Set to 1 to skip child account configuration
 #   DRY_RUN             - Set to 1 to preview without making changes
 #   FORCE               - Set to 1 to skip confirmations
@@ -59,12 +58,8 @@ ROLE_NAME="tailpipe-connector-role"
 CHILD_ROLE_NAME="tailpipe-child-connector"
 STACKSET_NAME="Tailpipe-CloudWatch-Child-StackSet"
 
-# Tailpipe connector role ARNs
-TAILPIPE_PROD_ROLE_ARN="arn:aws:iam::336268260260:role/TailpipeConnector-Prod"
-TAILPIPE_UAT_ROLE_ARN="arn:aws:iam::336268260260:role/TailpipeConnector-UAT"
-
-# Default to production unless overridden
-TAILPIPE_ROLE_ARN="${TAILPIPE_ROLE_ARN:-$TAILPIPE_PROD_ROLE_ARN}"
+# Tailpipe connector role ARN (production)
+TAILPIPE_ROLE_ARN="arn:aws:iam::336268260260:role/TailpipeConnector-Prod"
 
 # Options
 DRY_RUN="${DRY_RUN:-0}"
@@ -73,6 +68,10 @@ SKIP_CHILD_ACCOUNTS="${SKIP_CHILD_ACCOUNTS:-0}"
 DEBUG="${DEBUG:-0}"
 DEBUG_FLAG=""
 [ "$DEBUG" = "1" ] && DEBUG_FLAG="--debug"
+
+# Child account selection (for Organizations)
+# Values: "all" = all accounts, "123,456,789" = specific accounts, "" = interactive
+CHILD_ACCOUNTS="${CHILD_ACCOUNTS:-}"
 
 # Temp files tracking
 TEMP_FILES=()
@@ -144,6 +143,34 @@ cleanup_temp_files() {
 }
 
 trap cleanup_temp_files EXIT
+
+#==============================================================================
+# CSV AND ACCOUNT HELPER FUNCTIONS
+#==============================================================================
+
+# Count comma-separated items (handles empty strings correctly)
+count_csv_items() {
+  local input="$1"
+  if [ -z "$input" ]; then
+    echo 0
+  else
+    echo "$input" | awk -F',' '{print NF}'
+  fi
+}
+
+# Normalize comma-separated list (remove empty entries, trim spaces, deduplicate)
+normalize_csv() {
+  local input="$1"
+  # Split, trim, remove empty, deduplicate, rejoin
+  # Use sed to remove empty lines instead of grep to avoid pipefail issues
+  echo "$input" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;/^$/d' | awk '!seen[$0]++' | tr '\n' ',' | sed 's/,$//'
+}
+
+# Validate AWS account ID format (must be exactly 12 digits)
+is_valid_account_id() {
+  local id="$1"
+  echo "$id" | grep -qE '^[0-9]{12}$'
+}
 
 #==============================================================================
 # EXPORT HELPER FUNCTIONS
@@ -652,24 +679,185 @@ log_info "Role ARN: $ROLE_ARN"
 # PHASE 5: CHILD ACCOUNT CONFIGURATION (OPTIONAL)
 #==============================================================================
 
+# Initialize child account variables (used in JSON output even if skipped)
+CHILD_COUNT=0
+SELECTED_ACCOUNT_IDS=""
+USE_ALL_ACCOUNTS=0
+CONFIGURE_CHILDREN=0
+
 if [ "$IS_MANAGEMENT_ACCOUNT" = "1" ] && [ "$SKIP_CHILD_ACCOUNTS" = "0" ]; then
   log_section "Phase 5: Child Account Configuration"
 
   # Get list of accounts
   ACCOUNTS_JSON=$(aws organizations list-accounts 2>/dev/null || echo '{"Accounts":[]}')
-  CHILD_COUNT=$(echo "$ACCOUNTS_JSON" | jq "[.Accounts[] | select(.Id != \"$ACCOUNT_NUMBER\")] | length")
+  TOTAL_CHILD_COUNT=$(echo "$ACCOUNTS_JSON" | jq "[.Accounts[] | select(.Id != \"$ACCOUNT_NUMBER\" and .Status == \"ACTIVE\")] | length")
 
-  if [ "$CHILD_COUNT" -gt 0 ]; then
-    log_info "Found $CHILD_COUNT child account(s) in the organization"
+  if [ "$TOTAL_CHILD_COUNT" -gt 0 ]; then
+    log_info "Found $TOTAL_CHILD_COUNT child account(s) in the organization"
+    log_warning "Account status is checked at script start; changes during execution may cause deployment failures"
 
-    if [ "$FORCE" != "1" ] && [ "$DRY_RUN" = "0" ]; then
-      if ! confirm "Configure CloudWatch access for child accounts?"; then
-        log_warning "Skipping child account configuration"
-      else
+    if [ -n "$CHILD_ACCOUNTS" ]; then
+      if [ "$CHILD_ACCOUNTS" = "all" ]; then
+        # Configure all accounts
+        USE_ALL_ACCOUNTS=1
+        SELECTED_ACCOUNT_IDS=$(echo "$ACCOUNTS_JSON" | jq -r "[.Accounts[] | select(.Id != \"$ACCOUNT_NUMBER\" and .Status == \"ACTIVE\")] | .[].Id" | tr '\n' ',' | sed 's/,$//')
+        CHILD_COUNT=$TOTAL_CHILD_COUNT
         CONFIGURE_CHILDREN=1
+        log_info "Configuring all $CHILD_COUNT child accounts"
+      else
+        # Normalize input (handle spaces, double commas, duplicates)
+        NORMALIZED_ACCOUNTS=$(normalize_csv "$CHILD_ACCOUNTS")
+
+        if [ -z "$NORMALIZED_ACCOUNTS" ]; then
+          log_error "CHILD_ACCOUNTS is set but contains no valid entries"
+          exit 1
+        fi
+
+        # Validate format and existence of each account ID
+        INVALID_FORMAT=""
+        INVALID_ACCOUNTS=""
+        VALID_ACCOUNTS=""
+
+        # Use a temp file to avoid here-string (more portable)
+        ACCT_TEMP_FILE=$(create_temp_file "acct_validation.txt")
+        echo "$NORMALIZED_ACCOUNTS" | tr ',' '\n' > "$ACCT_TEMP_FILE"
+
+        while IFS= read -r acct_id; do
+          [ -z "$acct_id" ] && continue
+
+          # Validate format (must be exactly 12 digits)
+          if ! is_valid_account_id "$acct_id"; then
+            INVALID_FORMAT="$INVALID_FORMAT $acct_id"
+            continue
+          fi
+
+          # Validate account exists and is active in the organization
+          if ! echo "$ACCOUNTS_JSON" | jq -e ".Accounts[] | select(.Id == \"$acct_id\" and .Status == \"ACTIVE\")" > /dev/null 2>&1; then
+            INVALID_ACCOUNTS="$INVALID_ACCOUNTS $acct_id"
+          else
+            if [ -n "$VALID_ACCOUNTS" ]; then
+              VALID_ACCOUNTS="$VALID_ACCOUNTS,$acct_id"
+            else
+              VALID_ACCOUNTS="$acct_id"
+            fi
+          fi
+        done < "$ACCT_TEMP_FILE"
+
+        if [ -n "$INVALID_FORMAT" ]; then
+          log_error "Invalid account ID format (must be 12 digits):$INVALID_FORMAT"
+          exit 1
+        fi
+
+        if [ -n "$INVALID_ACCOUNTS" ]; then
+          log_error "Account IDs not found or inactive in organization:$INVALID_ACCOUNTS"
+          exit 1
+        fi
+
+        SELECTED_ACCOUNT_IDS="$VALID_ACCOUNTS"
+        CHILD_COUNT=$(count_csv_items "$SELECTED_ACCOUNT_IDS")
+        CONFIGURE_CHILDREN=1
+        log_info "Configuring $CHILD_COUNT selected child account(s)"
+      fi
+    elif [ -t 0 ] && [ "$FORCE" != "1" ]; then
+      # Interactive mode - terminal is available and not in force mode
+      echo "" >&2
+      log_info "Available child accounts ($TOTAL_CHILD_COUNT total):"
+      echo "" >&2
+
+      # Build account list with indices (compatible with Bash 3.x)
+      ACCOUNT_LIST_FILE=$(create_temp_file "account_list.txt")
+      echo "$ACCOUNTS_JSON" | jq -r ".Accounts[] | select(.Id != \"$ACCOUNT_NUMBER\" and .Status == \"ACTIVE\") | \"\(.Id)\t\(.Name)\"" > "$ACCOUNT_LIST_FILE"
+
+      i=1
+      while IFS=$'\t' read -r acct_id acct_name; do
+        printf "  [%2d] %-14s %s\n" "$i" "$acct_id" "$acct_name" >&2
+        i=$((i + 1))
+      done < "$ACCOUNT_LIST_FILE"
+
+      echo "" >&2
+      echo "Options:" >&2
+      echo "  - Enter account numbers to configure (comma-separated, e.g., 1,3,5)" >&2
+      echo "  - Press Enter to configure ALL $TOTAL_CHILD_COUNT accounts" >&2
+      echo "  - Type 'q' or 'n' to skip child account configuration" >&2
+      printf "Selection: " >&2
+      read -r SELECTION
+
+      # Check for quit/skip options
+      if [ "$SELECTION" = "q" ] || [ "$SELECTION" = "Q" ] || [ "$SELECTION" = "n" ] || [ "$SELECTION" = "N" ]; then
+        log_warning "Skipping child account configuration (user chose to skip)"
+        CONFIGURE_CHILDREN=0
+        CHILD_COUNT=0
+      elif [ -z "$SELECTION" ]; then
+        # All accounts selected
+        USE_ALL_ACCOUNTS=1
+        SELECTED_ACCOUNT_IDS=$(cut -f1 "$ACCOUNT_LIST_FILE" | tr '\n' ',' | sed 's/,$//')
+        CHILD_COUNT=$TOTAL_CHILD_COUNT
+        CONFIGURE_CHILDREN=1
+        log_info "Configuring all $CHILD_COUNT child accounts"
+      else
+        # Parse selection - convert indices to account IDs (with deduplication)
+        SELECTED_INDICES_FILE=$(create_temp_file "selected_indices.txt")
+        SELECTED_ACCOUNT_IDS=""
+        INVALID_SELECTIONS=""
+
+        # Normalize and deduplicate selections
+        echo "$SELECTION" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$' | awk '!seen[$0]++' > "$SELECTED_INDICES_FILE" || true
+
+        while read -r idx; do
+          [ -z "$idx" ] && continue
+          # Validate it's a positive number (1 or greater)
+          if ! echo "$idx" | grep -qE '^[1-9][0-9]*$'; then
+            INVALID_SELECTIONS="$INVALID_SELECTIONS $idx"
+            continue
+          fi
+          # Get account ID at that line number
+          acct_id=$(sed -n "${idx}p" "$ACCOUNT_LIST_FILE" | cut -f1)
+          if [ -n "$acct_id" ]; then
+            if [ -n "$SELECTED_ACCOUNT_IDS" ]; then
+              SELECTED_ACCOUNT_IDS="$SELECTED_ACCOUNT_IDS,$acct_id"
+            else
+              SELECTED_ACCOUNT_IDS="$acct_id"
+            fi
+          else
+            INVALID_SELECTIONS="$INVALID_SELECTIONS $idx"
+          fi
+        done < "$SELECTED_INDICES_FILE"
+
+        # Report invalid selections
+        if [ -n "$INVALID_SELECTIONS" ]; then
+          log_warning "Ignored invalid selections:$INVALID_SELECTIONS"
+        fi
+
+        if [ -z "$SELECTED_ACCOUNT_IDS" ]; then
+          # Give user another chance instead of hard exit
+          log_warning "No valid accounts selected"
+          echo "" >&2
+          printf "Would you like to configure ALL %d accounts instead? [y/N]: " "$TOTAL_CHILD_COUNT" >&2
+          read -r FALLBACK_RESPONSE
+          if [ "$FALLBACK_RESPONSE" = "y" ] || [ "$FALLBACK_RESPONSE" = "Y" ]; then
+            USE_ALL_ACCOUNTS=1
+            SELECTED_ACCOUNT_IDS=$(cut -f1 "$ACCOUNT_LIST_FILE" | tr '\n' ',' | sed 's/,$//')
+            CHILD_COUNT=$TOTAL_CHILD_COUNT
+            CONFIGURE_CHILDREN=1
+            log_info "Configuring all $CHILD_COUNT child accounts"
+          else
+            log_warning "Skipping child account configuration"
+            CONFIGURE_CHILDREN=0
+            CHILD_COUNT=0
+          fi
+        else
+          CHILD_COUNT=$(count_csv_items "$SELECTED_ACCOUNT_IDS")
+          CONFIGURE_CHILDREN=1
+          log_info "Selected $CHILD_COUNT account(s) for configuration"
+        fi
       fi
     else
+      # Non-interactive mode without CHILD_ACCOUNTS - default to all
+      USE_ALL_ACCOUNTS=1
+      SELECTED_ACCOUNT_IDS=$(echo "$ACCOUNTS_JSON" | jq -r "[.Accounts[] | select(.Id != \"$ACCOUNT_NUMBER\" and .Status == \"ACTIVE\")] | .[].Id" | tr '\n' ',' | sed 's/,$//')
+      CHILD_COUNT=$TOTAL_CHILD_COUNT
       CONFIGURE_CHILDREN=1
+      log_info "Configuring all $CHILD_COUNT child accounts (non-interactive mode)"
     fi
 
     if [ "${CONFIGURE_CHILDREN:-0}" = "1" ]; then
@@ -723,6 +911,14 @@ EOF
         RESTORE_CFN_STATUS=0
       fi
 
+      # Determine auto-deployment setting based on account selection
+      if [ "$USE_ALL_ACCOUNTS" = "1" ]; then
+        AUTO_DEPLOY_FLAG="--auto-deployment Enabled=true,RetainStacksOnAccountRemoval=false"
+      else
+        # Disable auto-deployment when configuring specific accounts
+        AUTO_DEPLOY_FLAG="--auto-deployment Enabled=false"
+      fi
+
       # Check if StackSet already exists
       if aws cloudformation describe-stack-set --stack-set-name "$STACKSET_NAME" --region "$REGION" 2>/dev/null | grep -q "StackSetName"; then
         log_warning "StackSet already exists, updating..."
@@ -740,7 +936,7 @@ EOF
           --stack-set-name "$STACKSET_NAME" \
           --template-body "file://$CFN_TEMPLATE_FILE" \
           --permission-model SERVICE_MANAGED \
-          --auto-deployment Enabled=true,RetainStacksOnAccountRemoval=false \
+          $AUTO_DEPLOY_FLAG \
           --capabilities CAPABILITY_NAMED_IAM \
           --region "$REGION" || {
           log_error "Failed to create StackSet"
@@ -750,16 +946,30 @@ EOF
       fi
 
       # Deploy stack instances
-      log_info "Deploying stack instances to child accounts..."
-
-      OPERATION_ID=$(execute aws cloudformation create-stack-instances \
-        --stack-set-name "$STACKSET_NAME" \
-        --deployment-targets OrganizationalUnitIds="$ROOT_ID" \
-        --regions us-east-1 \
-        --operation-preferences RegionConcurrencyType=PARALLEL,FailureToleranceCount=0,MaxConcurrentPercentage=100,ConcurrencyMode=SOFT_FAILURE_TOLERANCE \
-        --region "$REGION" \
-        --query 'OperationId' \
-        --output text 2>/dev/null || echo "")
+      if [ "$USE_ALL_ACCOUNTS" = "1" ]; then
+        log_info "Deploying stack instances to all $CHILD_COUNT child accounts..."
+        OPERATION_ID=$(execute aws cloudformation create-stack-instances \
+          --stack-set-name "$STACKSET_NAME" \
+          --deployment-targets "OrganizationalUnitIds=$ROOT_ID" \
+          --regions us-east-1 \
+          --operation-preferences RegionConcurrencyType=PARALLEL,FailureToleranceCount=0,MaxConcurrentPercentage=100,ConcurrencyMode=SOFT_FAILURE_TOLERANCE \
+          --region "$REGION" \
+          --query 'OperationId' \
+          --output text 2>/dev/null || echo "")
+      else
+        log_info "Deploying stack instances to $CHILD_COUNT selected account(s)..."
+        # Build JSON array of account IDs for deployment-targets
+        # SERVICE_MANAGED requires OrganizationalUnitIds + AccountFilterType=INTERSECTION + Accounts
+        ACCOUNTS_JSON_ARRAY=$(echo "$SELECTED_ACCOUNT_IDS" | tr ',' '\n' | sed 's/.*/"&"/' | tr '\n' ',' | sed 's/,$//')
+        OPERATION_ID=$(execute aws cloudformation create-stack-instances \
+          --stack-set-name "$STACKSET_NAME" \
+          --deployment-targets "OrganizationalUnitIds=$ROOT_ID,AccountFilterType=INTERSECTION,Accounts=[$ACCOUNTS_JSON_ARRAY]" \
+          --regions us-east-1 \
+          --operation-preferences RegionConcurrencyType=PARALLEL,FailureToleranceCount=0,MaxConcurrentPercentage=100,ConcurrencyMode=SOFT_FAILURE_TOLERANCE \
+          --region "$REGION" \
+          --query 'OperationId' \
+          --output text 2>/dev/null || echo "")
+      fi
 
       if [ -n "$OPERATION_ID" ] && [ "$DRY_RUN" = "0" ]; then
         log_info "Waiting for StackSet operation to complete (Operation ID: $OPERATION_ID)..."
@@ -894,6 +1104,8 @@ cat <<JSON_OUTPUT
   "childAccounts": {
     "configured": $([ "${CONFIGURE_CHILDREN:-0}" = "1" ] && echo "true" || echo "false"),
     "count": ${CHILD_COUNT:-0},
+    "allAccounts": $([ "${USE_ALL_ACCOUNTS:-0}" = "1" ] && echo "true" || echo "false"),
+    "selectedAccounts": $(if [ -n "${SELECTED_ACCOUNT_IDS:-}" ]; then echo "$SELECTED_ACCOUNT_IDS" | awk -F',' '{printf "["; for(i=1;i<=NF;i++){if(i>1)printf ","; printf "\"%s\"",$i}; printf "]"}'; else echo "[]"; fi),
     "childRoleName": "${CHILD_ROLE_NAME}",
     "stackSetName": "${STACKSET_NAME}"
   }

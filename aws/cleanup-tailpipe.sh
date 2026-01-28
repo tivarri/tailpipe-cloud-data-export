@@ -20,6 +20,8 @@
 #   FORCE           - Set to 1 to skip all confirmations
 #   KEEP_DATA       - Set to 1 to preserve S3 bucket and data
 #   KEEP_ROLE       - Set to 1 to preserve IAM role
+#   CHILD_ACCOUNTS  - Cleanup specific child accounts only (comma-separated IDs)
+#                     If not set, cleans up ALL child accounts
 #   DEBUG           - Set to 1 for verbose output
 #
 
@@ -61,9 +63,37 @@ DEBUG="${DEBUG:-0}"
 DEBUG_FLAG=""
 [ "$DEBUG" = "1" ] && DEBUG_FLAG="--debug"
 
+# Child account selection (for Organizations cleanup)
+# If not set, cleans up ALL child accounts
+CHILD_ACCOUNTS="${CHILD_ACCOUNTS:-}"
+
 #==============================================================================
 # HELPER FUNCTIONS
 #==============================================================================
+
+# Count comma-separated items (handles empty strings correctly)
+count_csv_items() {
+  local input="$1"
+  if [ -z "$input" ]; then
+    echo 0
+  else
+    echo "$input" | awk -F',' '{print NF}'
+  fi
+}
+
+# Normalize comma-separated list (remove empty entries, trim spaces, deduplicate)
+normalize_csv() {
+  local input="$1"
+  # Split, trim, remove empty, deduplicate, rejoin
+  # Use sed to remove empty lines instead of grep to avoid pipefail issues
+  echo "$input" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;/^$/d' | awk '!seen[$0]++' | tr '\n' ',' | sed 's/,$//'
+}
+
+# Validate AWS account ID format (must be exactly 12 digits)
+is_valid_account_id() {
+  local id="$1"
+  echo "$id" | grep -qE '^[0-9]{12}$'
+}
 
 log_info() {
   echo -e "${BLUE}ℹ${NC}  $*"
@@ -252,7 +282,15 @@ if [ "$FORCE" != "1" ]; then
     echo "  📚 CloudFormation StackSets:"
     echo "     - StackSet: $STACKSET_NAME"
     echo "     - Child account roles: $CHILD_ROLE_NAME"
-    echo "     - Affects $CHILD_COUNT child account(s)"
+    if [ -n "$CHILD_ACCOUNTS" ]; then
+      NORMALIZED_CLEANUP_ACCOUNTS=$(normalize_csv "$CHILD_ACCOUNTS")
+      CLEANUP_ACCT_COUNT=$(count_csv_items "$NORMALIZED_CLEANUP_ACCOUNTS")
+      echo "     - Affects $CLEANUP_ACCT_COUNT specific account(s): $NORMALIZED_CLEANUP_ACCOUNTS"
+      echo "     - StackSet will be retained"
+    else
+      echo "     - Affects ALL $CHILD_COUNT child account(s)"
+      echo "     - StackSet will be DELETED"
+    fi
     echo ""
   fi
 
@@ -417,6 +455,49 @@ fi
 if [ "$IS_MANAGEMENT_ACCOUNT" = "1" ] && [ "$CHILD_COUNT" -gt 0 ]; then
   log_section "Deleting CloudFormation StackSets"
 
+  # Determine if we're cleaning up all accounts or specific ones
+  CLEANUP_ALL_ACCOUNTS=1
+  ACCOUNTS_TO_CLEANUP=""
+  CLEANUP_ACCOUNT_COUNT=0
+
+  if [ -n "$CHILD_ACCOUNTS" ]; then
+    CLEANUP_ALL_ACCOUNTS=0
+    # Normalize the account list (remove spaces, empty entries, duplicates)
+    ACCOUNTS_TO_CLEANUP=$(normalize_csv "$CHILD_ACCOUNTS")
+
+    if [ -z "$ACCOUNTS_TO_CLEANUP" ]; then
+      log_error "CHILD_ACCOUNTS is set but contains no valid entries"
+      exit 1
+    fi
+
+    # Validate account ID formats
+    INVALID_FORMAT=""
+    VALIDATED_ACCOUNTS=""
+    for acct_id in $(echo "$ACCOUNTS_TO_CLEANUP" | tr ',' ' '); do
+      if ! is_valid_account_id "$acct_id"; then
+        INVALID_FORMAT="$INVALID_FORMAT $acct_id"
+      else
+        if [ -n "$VALIDATED_ACCOUNTS" ]; then
+          VALIDATED_ACCOUNTS="$VALIDATED_ACCOUNTS,$acct_id"
+        else
+          VALIDATED_ACCOUNTS="$acct_id"
+        fi
+      fi
+    done
+
+    if [ -n "$INVALID_FORMAT" ]; then
+      log_error "Invalid account ID format (must be 12 digits):$INVALID_FORMAT"
+      exit 1
+    fi
+
+    ACCOUNTS_TO_CLEANUP="$VALIDATED_ACCOUNTS"
+    CLEANUP_ACCOUNT_COUNT=$(count_csv_items "$ACCOUNTS_TO_CLEANUP")
+    log_info "Cleaning up $CLEANUP_ACCOUNT_COUNT specific account(s)"
+    log_warning "Note: Account IDs are validated for format only, not checked against existing stack instances"
+  else
+    log_info "Cleaning up ALL $CHILD_COUNT child accounts"
+  fi
+
   # Check all regions where stacks might exist
   REGIONS_TO_CHECK=("us-east-1" "eu-west-1" "ap-southeast-1")
 
@@ -426,7 +507,7 @@ if [ "$IS_MANAGEMENT_ACCOUNT" = "1" ] && [ "$CHILD_COUNT" -gt 0 ]; then
     if aws cloudformation describe-stack-set --stack-set-name "$STACKSET_NAME" --region "$REGION" 2>/dev/null | grep -q "StackSetName"; then
       log_info "Found StackSet in region: $REGION"
 
-      # Delete all stack instances first
+      # Delete stack instances
       log_info "Deleting stack instances..."
 
       if [ "$DRY_RUN" = "0" ]; then
@@ -438,15 +519,32 @@ if [ "$IS_MANAGEMENT_ACCOUNT" = "1" ] && [ "$CHILD_COUNT" -gt 0 ]; then
           --output text 2>/dev/null || echo "")
 
         if [ -n "$INSTANCES" ]; then
-          OPERATION_ID=$(execute aws cloudformation delete-stack-instances \
-            --stack-set-name "$STACKSET_NAME" \
-            --deployment-targets OrganizationalUnitIds="$ROOT_ID" \
-            --regions us-east-1 \
-            --no-retain-stacks \
-            --operation-preferences RegionConcurrencyType=PARALLEL,MaxConcurrentPercentage=100 \
-            --region "$REGION" \
-            --query 'OperationId' \
-            --output text 2>/dev/null || echo "")
+          if [ "$CLEANUP_ALL_ACCOUNTS" = "1" ]; then
+            # Delete all stack instances using OU targeting
+            OPERATION_ID=$(execute aws cloudformation delete-stack-instances \
+              --stack-set-name "$STACKSET_NAME" \
+              --deployment-targets OrganizationalUnitIds="$ROOT_ID" \
+              --regions us-east-1 \
+              --no-retain-stacks \
+              --operation-preferences RegionConcurrencyType=PARALLEL,MaxConcurrentPercentage=100 \
+              --region "$REGION" \
+              --query 'OperationId' \
+              --output text 2>/dev/null || echo "")
+          else
+            # Delete only specific account instances
+            # Build JSON array of account IDs
+            ACCOUNTS_JSON_ARRAY=$(echo "$ACCOUNTS_TO_CLEANUP" | tr ',' '\n' | sed 's/.*/"&"/' | tr '\n' ',' | sed 's/,$//')
+            log_info "Deleting stack instances from accounts: $ACCOUNTS_TO_CLEANUP"
+            OPERATION_ID=$(execute aws cloudformation delete-stack-instances \
+              --stack-set-name "$STACKSET_NAME" \
+              --deployment-targets "OrganizationalUnitIds=$ROOT_ID,AccountFilterType=INTERSECTION,Accounts=[$ACCOUNTS_JSON_ARRAY]" \
+              --regions us-east-1 \
+              --no-retain-stacks \
+              --operation-preferences RegionConcurrencyType=PARALLEL,MaxConcurrentPercentage=100 \
+              --region "$REGION" \
+              --query 'OperationId' \
+              --output text 2>/dev/null || echo "")
+          fi
 
           if [ -n "$OPERATION_ID" ]; then
             log_info "Waiting for stack instance deletion (Operation ID: $OPERATION_ID)..."
@@ -475,22 +573,44 @@ if [ "$IS_MANAGEMENT_ACCOUNT" = "1" ] && [ "$CHILD_COUNT" -gt 0 ]; then
             done
 
             if [ $WAIT_COUNT -ge $MAX_WAIT ]; then
-              log_warning "Stack instance deletion timed out"
+              log_warning "Stack instance deletion timed out after ~10 minutes"
+              log_warning "Operation may still complete - check AWS CloudFormation console for status"
             fi
           fi
         else
           log_info "No stack instances found"
         fi
 
-        # Delete StackSet
-        log_info "Deleting StackSet..."
-        execute aws cloudformation delete-stack-set \
-          --stack-set-name "$STACKSET_NAME" \
-          --region "$REGION" && \
-          log_success "StackSet deleted" || \
-          log_warning "Failed to delete StackSet"
+        # Only delete StackSet itself if cleaning up ALL accounts
+        if [ "$CLEANUP_ALL_ACCOUNTS" = "1" ]; then
+          # Verify no instances remain before deleting StackSet
+          REMAINING=$(aws cloudformation list-stack-instances \
+            --stack-set-name "$STACKSET_NAME" \
+            --region "$REGION" \
+            --query 'Summaries[].Account' \
+            --output text 2>/dev/null || echo "")
+
+          if [ -z "$REMAINING" ]; then
+            log_info "Deleting StackSet..."
+            execute aws cloudformation delete-stack-set \
+              --stack-set-name "$STACKSET_NAME" \
+              --region "$REGION" && \
+              log_success "StackSet deleted" || \
+              log_warning "Failed to delete StackSet"
+          else
+            log_warning "Cannot delete StackSet - some stack instances still exist"
+            log_info "Remaining accounts: $REMAINING"
+          fi
+        else
+          log_info "StackSet retained (only cleaning up specific accounts)"
+        fi
       else
-        log_info "[DRY RUN] Would delete StackSet: $STACKSET_NAME"
+        if [ "$CLEANUP_ALL_ACCOUNTS" = "1" ]; then
+          log_info "[DRY RUN] Would delete StackSet: $STACKSET_NAME"
+        else
+          log_info "[DRY RUN] Would delete stack instances from: $ACCOUNTS_TO_CLEANUP"
+          log_info "[DRY RUN] StackSet would be retained"
+        fi
       fi
 
       break  # Found it, no need to check other regions
