@@ -152,6 +152,9 @@ az role assignment create \
   --assignee <USER_OR_GROUP_OBJECT_ID> \
   --role "Tailpipe Setup Operator" \
   --scope "/providers/Microsoft.Management/managementGroups/<MG_ID>"
+
+# For CSP, use the CSP role name instead:
+# --role "Tailpipe Setup Operator (CSP)"
 ```
 
 This also requires updating `AssignableScopes` in the role definition to include the management group.
