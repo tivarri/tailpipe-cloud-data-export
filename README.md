@@ -57,33 +57,26 @@ tailpipe-cloud-data-export/
 │   ├── README-SETUP.md          # Complete AWS guide
 │   ├── setup-tailpipe.sh        # Main setup script
 │   ├── cleanup-tailpipe.sh      # Cleanup script
-│   ├── cli/                     # CLI scripts
-│   ├── child-accounts/          # Organization child account setup
-│   └── cloudformation/          # CloudFormation templates
+│   ├── iam-policy-single-account.json
+│   └── iam-policy-organization.json
 │
 ├── azure/                       # Azure automation
 │   ├── README-SETUP.md          # Complete Azure guide
-│   ├── CLAUDE.md                # Development guidance
 │   ├── setup-tailpipe.sh        # Unified setup script
 │   ├── cleanup-tailpipe.sh      # Cleanup script
-│   ├── cli/                     # Manual CLI scripts
-│   ├── automation/              # Azure Policy & Automation Account
-│   │   ├── README-policy.md     # Policy implementation guide
-│   │   ├── policy-*.json        # Policy definitions
-│   │   ├── deploy-policy.sh     # Policy deployment
-│   │   └── *.ps1                # PowerShell runbooks
-│   └── arm/                     # ARM templates
+│   ├── custom-role-tailpipe-setup.json
+│   └── custom-role-tailpipe-setup-csp.json
 │
 ├── gcp/                         # GCP automation
 │   ├── README-SETUP.md          # Complete GCP guide
-│   ├── SUMMARY.md               # Architecture overview
 │   ├── setup-tailpipe.sh        # Main setup script
 │   └── cleanup-tailpipe.sh      # Cleanup script
 │
 └── docs/                        # Cross-cloud documentation
     ├── architecture.md          # Architecture overview
     ├── security.md              # Security best practices
-    └── troubleshooting.md       # Common issues
+    ├── troubleshooting.md       # Common issues
+    └── operator-permissions.md  # Operator permission policies
 ```
 
 ## Features
@@ -191,7 +184,7 @@ DRY_RUN=1 gcp/setup-tailpipe.sh
 All scripts support environment variable configuration for non-interactive deployment. See individual platform documentation for details:
 
 - [AWS Environment Variables](aws/README-SETUP.md#environment-variables)
-- [Azure Environment Variables](azure/README-SETUP.md) (see CLAUDE.md for policy variables)
+- [Azure Environment Variables](azure/README-SETUP.md)
 - [GCP Environment Variables](gcp/README-SETUP.md#common-commands)
 
 ## Security
@@ -258,7 +251,7 @@ KEEP_DATA=1 ./cleanup-tailpipe.sh
 
 See platform-specific troubleshooting guides:
 - [AWS Troubleshooting](aws/README-SETUP.md#troubleshooting)
-- [Azure Troubleshooting](azure/README-SETUP.md) (see CLAUDE.md for policy troubleshooting)
+- [Azure Troubleshooting](azure/README-SETUP.md)
 - [GCP Troubleshooting](gcp/README-SETUP.md#troubleshooting)
 
 ### Debug Mode
@@ -274,9 +267,7 @@ DEBUG=1 ./setup-tailpipe.sh
 ### Platform-Specific Guides
 - **[AWS Setup Guide](aws/README-SETUP.md)** - Complete AWS implementation guide
 - **[Azure Setup Guide](azure/README-SETUP.md)** - Azure CLI and unified script guide
-- **[Azure Development Guide](azure/CLAUDE.md)** - Policy implementation and development
 - **[GCP Setup Guide](gcp/README-SETUP.md)** - Complete GCP implementation guide
-- **[GCP Architecture](gcp/SUMMARY.md)** - GCP architecture and features overview
 
 ### Cross-Platform Documentation
 - [Architecture Overview](docs/architecture.md) - Cross-cloud architecture patterns

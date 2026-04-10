@@ -69,9 +69,6 @@ logs/
 .settings/
 .buildpath
 
-# Claude Code
-.claude/
-
 # Temporary files
 tmp/
 temp/
