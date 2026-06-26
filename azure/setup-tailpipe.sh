@@ -33,6 +33,8 @@
 #   DRY_RUN               - Set to 1 to preview without making changes
 #   SKIP_AUTOMATION       - Set to 1 to skip Automation Account setup
 #   SKIP_POLICY           - Set to 1 to skip Policy deployment
+#   SKIP_BILLING_EXPORT   - Set to 1 to skip billing-scope export (per-subscription only)
+#   MONITORING_SCOPE      - Monitoring Reader scope: managementGroup (default) | subscription | none
 #   DEBUG                 - Set to 1 for verbose Azure CLI output
 #
 
@@ -111,6 +113,23 @@ DRY_RUN="${DRY_RUN:-0}"
 DEBUG="${DEBUG:-0}"
 DEBUG_FLAG=""
 [ "$DEBUG" = "1" ] && DEBUG_FLAG="--debug"
+
+# Monitoring Reader scope (controls the Phase 1 Monitoring Reader assignment)
+#   managementGroup - assign once at the root management group (default; widest scope)
+#   subscription    - assign per-subscription on the targeted subscriptions only
+#   none            - do not assign Monitoring Reader at all (cost-only setup)
+# Validated here so a typo fails fast before any changes are attempted.
+MONITORING_SCOPE="${MONITORING_SCOPE:-managementGroup}"
+case "$MONITORING_SCOPE" in
+  managementGroup|subscription|none) ;;
+  *)
+    echo "ERROR: Invalid MONITORING_SCOPE: '$MONITORING_SCOPE' (expected: managementGroup, subscription, or none)" >&2
+    exit 1
+    ;;
+esac
+
+# Skip billing-scope (enterprise-wide) cost export; use per-subscription exports only
+SKIP_BILLING_EXPORT="${SKIP_BILLING_EXPORT:-0}"
 
 # Required resource providers
 REQUIRED_PROVIDERS=(
@@ -388,6 +407,8 @@ ENVIRONMENT VARIABLES:
   DRY_RUN               Set to 1 to preview without making changes
   SKIP_AUTOMATION       Set to 1 to skip Automation Account setup
   SKIP_POLICY           Set to 1 to skip Policy deployment
+  SKIP_BILLING_EXPORT   Set to 1 to skip billing-scope export (per-subscription only)
+  MONITORING_SCOPE      Monitoring Reader scope: managementGroup (default), subscription, none
   DEBUG                 Set to 1 for verbose Azure CLI output
 
 EXAMPLES:
@@ -402,6 +423,11 @@ EXAMPLES:
 
   Skip automation components:
     SKIP_AUTOMATION=1 SKIP_POLICY=1 ./setup-tailpipe.sh
+
+  Tenant-scoped POC (subscription-scope only, no MG/billing/tenant-root grants):
+    TENANT_ID=<tenant> SUBS="<sub-1> <sub-2>" STORAGE_SUBID=<sub> LOCATION=uksouth \
+      MONITORING_SCOPE=subscription SKIP_BILLING_EXPORT=1 \
+      SKIP_POLICY=1 SKIP_AUTOMATION=1 ./setup-tailpipe.sh
 
 REQUIREMENTS:
   - Azure CLI version 2.50.0 or later
@@ -825,24 +851,35 @@ if ! create_role_assignment "$SP_OBJECT_ID" "Storage Blob Data Reader" "$STORAGE
   exit 1
 fi
 
-# Assign RBAC - Monitoring Reader at Management Group or Subscription
-log_info "Assigning Monitoring Reader role..."
-
-ROOT_MG=$(az account management-group list --query "[?properties.details.parent==null].name | [0]" -o tsv 2>/dev/null || echo "")
+# Assign RBAC - Monitoring Reader (scope controlled by MONITORING_SCOPE)
+ROOT_MG=""
 FALLBACK_PER_SUB=0
 
-if [ -z "$ROOT_MG" ] || [ "$ROOT_MG" = "null" ]; then
-  log_warning "Could not determine Root Management Group, will assign per-subscription"
-  FALLBACK_PER_SUB=1
-else
-  MG_SCOPE="/providers/Microsoft.Management/managementGroups/$ROOT_MG"
-  if create_role_assignment "$SP_OBJECT_ID" "Monitoring Reader" "$MG_SCOPE" "Monitoring Reader at MG: $ROOT_MG"; then
-    log_success "Monitoring Reader assigned at Management Group level"
-  else
-    log_warning "MG-scope assignment failed, falling back to per-subscription"
+case "$MONITORING_SCOPE" in
+  none)
+    log_info "Skipping Monitoring Reader assignment (MONITORING_SCOPE=none)"
+    ;;
+  subscription)
+    log_info "Assigning Monitoring Reader role (per-subscription scope)..."
     FALLBACK_PER_SUB=1
-  fi
-fi
+    ;;
+  managementGroup)
+    log_info "Assigning Monitoring Reader role..."
+    ROOT_MG=$(az account management-group list --query "[?properties.details.parent==null].name | [0]" -o tsv 2>/dev/null || echo "")
+    if [ -z "$ROOT_MG" ] || [ "$ROOT_MG" = "null" ]; then
+      log_warning "Could not determine Root Management Group, will assign per-subscription"
+      FALLBACK_PER_SUB=1
+    else
+      MG_SCOPE="/providers/Microsoft.Management/managementGroups/$ROOT_MG"
+      if create_role_assignment "$SP_OBJECT_ID" "Monitoring Reader" "$MG_SCOPE" "Monitoring Reader at MG: $ROOT_MG"; then
+        log_success "Monitoring Reader assigned at Management Group level"
+      else
+        log_warning "MG-scope assignment failed, falling back to per-subscription"
+        FALLBACK_PER_SUB=1
+      fi
+    fi
+    ;;
+esac
 
 if [ "$FALLBACK_PER_SUB" = "1" ]; then
   log_info "Assigning Monitoring Reader per subscription..."
@@ -885,7 +922,12 @@ EXPORT_SKIPPED_REASONS=()
 BILLING_EXPORT_TYPE=""    # Track billing export type
 
 # Try to create billing-scope export for non-CSP subscriptions
-if [ -n "$NONCSP_SUBS" ]; then
+if [ "$SKIP_BILLING_EXPORT" = "1" ]; then
+  if [ -n "$NONCSP_SUBS" ]; then
+    log_info "Billing-scope export disabled (SKIP_BILLING_EXPORT=1); using per-subscription exports for MCA/EA subscriptions"
+    FORCE_PER_SUB_EXPORTS=1
+  fi
+elif [ -n "$NONCSP_SUBS" ]; then
   log_info "Attempting to create billing-scope export for MCA/EA subscriptions..."
 
   if [ -z "${BILLING_SCOPE:-}" ]; then
@@ -1609,7 +1651,11 @@ fi
 log_section "Configuration Summary"
 
 # Build monitoring configuration
-if [ "$FALLBACK_PER_SUB" = "1" ]; then
+if [ "$MONITORING_SCOPE" = "none" ]; then
+  MON_MODE="none"
+  MON_SUBS_JSON="[]"
+  MG_ID_JSON="null"
+elif [ "$FALLBACK_PER_SUB" = "1" ]; then
   MON_MODE="perSubscription"
   MON_SUBS_JSON=""
   for sid in $SUB_IDS; do

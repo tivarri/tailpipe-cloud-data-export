@@ -75,9 +75,12 @@ All configuration can be controlled via environment variables:
 | `BILLING_SCOPE` | Billing profile resource ID | Auto-detected | `/providers/Microsoft.Billing/...` |
 | `STORAGE_SUBID` | Subscription for storage | Auto-detected | `9ea664c2-812d-...` |
 | `TENANT_ID` | Target tenant ID | Current tenant | `00000000-0000-...` |
+| `SUBS` | Space-separated subscription IDs to target (limits scope to these subs) | All accessible | `"sub-1 sub-2"` |
 | `DRY_RUN` | Preview without changes | `0` | `1` |
 | `SKIP_AUTOMATION` | Skip Automation Account | `0` | `1` |
 | `SKIP_POLICY` | Skip Azure Policy | `0` | `1` |
+| `SKIP_BILLING_EXPORT` | Skip billing-scope export; use per-subscription exports only | `0` | `1` |
+| `MONITORING_SCOPE` | Monitoring Reader scope: `managementGroup`, `subscription`, or `none` | `managementGroup` | `subscription` |
 | `DEBUG` | Verbose Azure CLI output | `0` | `1` |
 
 ### Examples
@@ -104,6 +107,52 @@ SKIP_POLICY=1 \
 LOCATION=uksouth \
 ./setup-tailpipe.sh
 ```
+
+### Tenant-scoped POC deployment
+
+For a proof-of-concept that must stay **strictly within a single tenant and a
+specific set of subscriptions** — touching no parent/root management group, no
+enterprise-wide billing account, and no tenant-root (`/`) scope — combine the
+scoping flags below. This is the recommended configuration when the target
+tenant sits under a wider organisation-wide management group hierarchy.
+
+```bash
+TENANT_ID=<tenant-id> \
+SUBS="<sub-1> <sub-2> ..." \
+STORAGE_SUBID=<sub-to-host-storage> \
+LOCATION=uksouth \
+ENTERPRISE_APP_ID=<UAT or PROD app id> \
+MONITORING_SCOPE=subscription \
+SKIP_BILLING_EXPORT=1 \
+SKIP_POLICY=1 \
+SKIP_AUTOMATION=1 \
+./setup-tailpipe.sh
+```
+
+What each flag scopes down:
+
+| Flag | Effect | Scope avoided |
+|------|--------|---------------|
+| `SUBS="..."` | Only the listed subscriptions are processed | Other subscriptions in the tenant |
+| `MONITORING_SCOPE=subscription` | Monitoring Reader is granted per listed subscription | Root management group (`managementGroup` default) |
+| `SKIP_BILLING_EXPORT=1` | Per-subscription cost exports only | Enterprise/organisation-wide billing account & profile |
+| `SKIP_POLICY=1` | No Azure Policy deployed | Policy assignment at the root management group |
+| `SKIP_AUTOMATION=1` | No Automation Account / managed identity | `Contributor`/`Reader` grants at tenant root (`/`) |
+
+With this configuration the Tailpipe service principal receives only
+`Storage Blob Data Reader` (scoped to the dedicated storage account) plus
+`Monitoring Reader` on each listed subscription. Use `MONITORING_SCOPE=none`
+instead for a cost-only POC with no metrics access — this emits
+`"monitoringAccess": { "mode": "none", ... }` in the summary JSON.
+
+> **Note:** `MONITORING_SCOPE=subscription` grants `Monitoring Reader` on every
+> subscription the script processes. Always pair it with `SUBS="<ids>"` (as in
+> the POC example) to bound it to the intended subscriptions; without `SUBS` it
+> applies to **all** accessible subscriptions in the tenant.
+
+Always validate with `DRY_RUN=1` first and review the output for any
+`managementGroups` scope, billing-scope export, or Phase 3 (Automation) section
+before running for real.
 
 ## What Gets Created
 
@@ -206,6 +255,30 @@ After successful deployment, you'll receive a JSON configuration summary:
 ```
 
 **Save this output** - it contains all the information needed for Tailpipe onboarding.
+
+The shape varies with the scoping flags. For a tenant-scoped POC
+(`MONITORING_SCOPE=subscription SKIP_BILLING_EXPORT=1 SKIP_POLICY=1 SKIP_AUTOMATION=1`)
+the relevant fields instead read:
+
+```json
+{
+  "monitoringAccess": {
+    "mode": "perSubscription",
+    "managementGroupId": null,
+    "subscriptions": ["sub-id-1", "sub-id-2"]
+  },
+  "costExports": {
+    "billing": null,
+    "perSubscription": [
+      {"subscriptionId": "sub-id-1", "name": "TailpipeDataExport-aaaaaa", "type": "ActualCost"}
+    ]
+  },
+  "automation": { "policyEnabled": false, "runbookEnabled": false }
+}
+```
+
+With `MONITORING_SCOPE=none`, `monitoringAccess.mode` is `"none"` with an empty
+`subscriptions` array and `managementGroupId: null`.
 
 ## Validation
 
