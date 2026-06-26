@@ -620,6 +620,11 @@ log_info "Enumerating subscriptions..."
 if [ -n "${SUBS:-}" ]; then
   log_info "Using subscriptions from SUBS env var"
   SUB_IDS="$SUBS"
+  # MAP is only populated when enumerating accounts below; define it so the
+  # interactive storage picker (which looks up names from MAP) can't trip
+  # `set -u` when SUBS is set but STORAGE_SUBID is not. Names fall back to
+  # "(Unknown)" in that case, which the picker already handles.
+  MAP=""
 else
   MAP=$(az account list --all --refresh --only-show-errors --query "[?state!='Disabled'].{id:id,tenantId:tenantId,name:name}" -o tsv)
   if [ -n "$TARGET_TENANT" ]; then
