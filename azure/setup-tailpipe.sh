@@ -19,13 +19,16 @@
 #                their applicable time period
 #
 # Usage:
-#   ./setup-tailpipe.sh                    # Interactive mode
-#   DRY_RUN=1 ./setup-tailpipe.sh          # Preview changes without executing
-#   LOCATION=uksouth ./setup-tailpipe.sh   # Non-interactive with env vars
+#   TAILPIPE_ENV=prod ./setup-tailpipe.sh                    # Interactive mode
+#   TAILPIPE_ENV=prod DRY_RUN=1 ./setup-tailpipe.sh          # Preview without executing
+#   TAILPIPE_ENV=prod LOCATION=uksouth ./setup-tailpipe.sh   # Non-interactive
 #
 # Environment Variables:
 #   LOCATION              - Azure region (e.g., uksouth, westeurope)
-#   ENTERPRISE_APP_ID     - Tailpipe app ID (default: UAT)
+#   TAILPIPE_ENV          - Target Tailpipe environment: prod | uat (required
+#                           unless ENTERPRISE_APP_ID is set; no default)
+#   ENTERPRISE_APP_ID     - Explicit Tailpipe app ID (overrides nothing: if both
+#                           this and TAILPIPE_ENV are set they must agree)
 #   MANAGEMENT_GROUP_ID   - Target MG for policy deployment (auto-detected if not set)
 #   BILLING_SCOPE         - Billing profile ID (auto-detected if not set)
 #   STORAGE_SUBID         - Subscription for storage account (auto-detected if not set)
@@ -46,7 +49,7 @@ trap 'echo "❌ Error on line $LINENO (exit $?): see above. If you saw: The cont
 #==============================================================================
 
 # Script version
-VERSION="1.3.0"
+VERSION="1.4.0"
 
 #==============================================================================
 # API VERSION DOCUMENTATION
@@ -102,9 +105,6 @@ PROVIDER_POLICY_ASSIGNMENT="register-providers-a"
 # Tailpipe Enterprise Application IDs
 TAILPIPE_UAT_APP_ID="071b0391-48e8-483c-b652-a8a6cd43a018"
 TAILPIPE_PROD_APP_ID="f5f07900-0484-4506-a34d-ec781138342a"
-
-# Default to UAT unless overridden
-ENTERPRISE_APP_ID="${ENTERPRISE_APP_ID:-$TAILPIPE_UAT_APP_ID}"
 
 # Dry run mode
 DRY_RUN="${DRY_RUN:-0}"
@@ -399,7 +399,10 @@ OPTIONS:
 
 ENVIRONMENT VARIABLES:
   LOCATION              Azure region (e.g., uksouth, westeurope)
-  ENTERPRISE_APP_ID     Tailpipe app ID (default: UAT)
+  TAILPIPE_ENV          Target Tailpipe environment: prod | uat (required
+                        unless ENTERPRISE_APP_ID is set; no default)
+  ENTERPRISE_APP_ID     Explicit Tailpipe app ID (alternative to TAILPIPE_ENV;
+                        if both are set they must agree)
   MANAGEMENT_GROUP_ID   Target MG for policy deployment (auto-detected if not set)
   BILLING_SCOPE         Billing profile ID (auto-detected if not set)
   STORAGE_SUBID         Subscription for storage account (auto-detected if not set)
@@ -412,20 +415,21 @@ ENVIRONMENT VARIABLES:
   DEBUG                 Set to 1 for verbose Azure CLI output
 
 EXAMPLES:
-  Interactive mode:
-    ./setup-tailpipe.sh
+  Interactive mode (customer onboarding):
+    TAILPIPE_ENV=prod ./setup-tailpipe.sh
 
   Preview changes without executing:
-    DRY_RUN=1 ./setup-tailpipe.sh
+    TAILPIPE_ENV=prod DRY_RUN=1 ./setup-tailpipe.sh
 
   Non-interactive with environment variables:
-    LOCATION=uksouth ./setup-tailpipe.sh
+    TAILPIPE_ENV=prod LOCATION=uksouth ./setup-tailpipe.sh
 
   Skip automation components:
-    SKIP_AUTOMATION=1 SKIP_POLICY=1 ./setup-tailpipe.sh
+    TAILPIPE_ENV=prod SKIP_AUTOMATION=1 SKIP_POLICY=1 ./setup-tailpipe.sh
 
   Tenant-scoped POC (subscription-scope only, no MG/billing/tenant-root grants):
-    TENANT_ID=<tenant> SUBS="<sub-1> <sub-2>" STORAGE_SUBID=<sub> LOCATION=uksouth \
+    TAILPIPE_ENV=prod TENANT_ID=<tenant> SUBS="<sub-1> <sub-2>" \
+      STORAGE_SUBID=<sub> LOCATION=uksouth \
       MONITORING_SCOPE=subscription SKIP_BILLING_EXPORT=1 \
       SKIP_POLICY=1 SKIP_AUTOMATION=1 ./setup-tailpipe.sh
 
@@ -450,6 +454,47 @@ for arg in "$@"; do
       ;;
   esac
 done
+
+# Select the target Tailpipe environment. There is deliberately NO default:
+# this script grants a Tailpipe service principal read access to the
+# customer's cost data, and a dropped env var must never silently point those
+# grants at the wrong environment (exports would run but ingest would never
+# happen, with no error on the customer side). Validated after --help handling
+# so a bad or missing value fails fast before any changes are attempted.
+TAILPIPE_ENV="${TAILPIPE_ENV:-}"
+case "$(echo "$TAILPIPE_ENV" | tr '[:upper:]' '[:lower:]')" in
+  prod) TAILPIPE_ENV_APP_ID="$TAILPIPE_PROD_APP_ID" ;;
+  uat)  TAILPIPE_ENV_APP_ID="$TAILPIPE_UAT_APP_ID" ;;
+  "")   TAILPIPE_ENV_APP_ID="" ;;
+  *)
+    echo "ERROR: Invalid TAILPIPE_ENV: '$TAILPIPE_ENV' (expected: prod or uat)" >&2
+    exit 1
+    ;;
+esac
+
+if [ -n "${ENTERPRISE_APP_ID:-}" ]; then
+  if [ -n "$TAILPIPE_ENV_APP_ID" ] && [ "$ENTERPRISE_APP_ID" != "$TAILPIPE_ENV_APP_ID" ]; then
+    echo "ERROR: TAILPIPE_ENV=$TAILPIPE_ENV conflicts with ENTERPRISE_APP_ID=$ENTERPRISE_APP_ID" >&2
+    echo "       $TAILPIPE_ENV expects app ID $TAILPIPE_ENV_APP_ID. Unset one of the two." >&2
+    exit 1
+  fi
+elif [ -n "$TAILPIPE_ENV_APP_ID" ]; then
+  ENTERPRISE_APP_ID="$TAILPIPE_ENV_APP_ID"
+else
+  echo "ERROR: No target environment selected. Set TAILPIPE_ENV=prod or TAILPIPE_ENV=uat" >&2
+  echo "       (or set ENTERPRISE_APP_ID explicitly)." >&2
+  echo "" >&2
+  echo "       prod: $TAILPIPE_PROD_APP_ID  <- customer onboarding" >&2
+  echo "       uat:  $TAILPIPE_UAT_APP_ID  <- Tailpipe-internal testing only" >&2
+  exit 1
+fi
+
+# Label for the target-environment banner printed at startup
+case "$ENTERPRISE_APP_ID" in
+  "$TAILPIPE_PROD_APP_ID") TAILPIPE_ENV_LABEL="PROD" ;;
+  "$TAILPIPE_UAT_APP_ID")  TAILPIPE_ENV_LABEL="UAT" ;;
+  *)                       TAILPIPE_ENV_LABEL="CUSTOM" ;;
+esac
 
 # Acquire file lock to prevent concurrent execution
 LOCK_FILE="/tmp/tailpipe-azure-setup.lock"
@@ -480,6 +525,14 @@ log_section "Tailpipe Azure Setup v$VERSION"
 
 if [ "$DRY_RUN" = "1" ]; then
   log_warning "DRY RUN MODE - No changes will be made"
+fi
+
+# Prominent target-environment banner: this must be unambiguous in every
+# transcript (including DRY_RUN output reviewed by customers) so a run
+# pointed at the wrong environment is caught before, not after, onboarding.
+log_warning "Target environment: ${TAILPIPE_ENV_LABEL} - granting access to Tailpipe app $ENTERPRISE_APP_ID"
+if [ "$TAILPIPE_ENV_LABEL" = "UAT" ]; then
+  log_warning "UAT is for Tailpipe-internal testing only. Customer onboarding must use TAILPIPE_ENV=prod"
 fi
 
 # Show and check Azure CLI version

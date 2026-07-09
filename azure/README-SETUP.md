@@ -39,8 +39,14 @@ This toolkit provides a unified solution for configuring Azure Cost Management e
 
 ```bash
 chmod +x setup-tailpipe.sh
-./setup-tailpipe.sh
+TAILPIPE_ENV=prod ./setup-tailpipe.sh
 ```
+
+`TAILPIPE_ENV` selects which Tailpipe environment is granted access to your
+cost data (`prod` for customer onboarding, `uat` for Tailpipe-internal
+testing). It has **no default** — the script refuses to run without it (or an
+explicit `ENTERPRISE_APP_ID`), and prints a banner showing the targeted
+environment at the start of every run.
 
 You'll be prompted for:
 - Azure region (e.g., `uksouth`, `westeurope`)
@@ -50,13 +56,13 @@ You'll be prompted for:
 
 ```bash
 chmod +x setup-tailpipe.sh
-LOCATION=uksouth ./setup-tailpipe.sh
+TAILPIPE_ENV=prod LOCATION=uksouth ./setup-tailpipe.sh
 ```
 
 #### Dry Run (Preview changes without executing)
 
 ```bash
-DRY_RUN=1 ./setup-tailpipe.sh
+TAILPIPE_ENV=prod DRY_RUN=1 ./setup-tailpipe.sh
 ```
 
 This shows exactly what would be created without making any changes.
@@ -70,7 +76,8 @@ All configuration can be controlled via environment variables:
 | Variable | Description | Default | Example |
 |----------|-------------|---------|---------|
 | `LOCATION` | Azure region for resources | _(prompt)_ | `uksouth` |
-| `ENTERPRISE_APP_ID` | Tailpipe application ID | UAT App ID | `071b0391-48e8-483c-b652-a8a6cd43a018` |
+| `TAILPIPE_ENV` | Target Tailpipe environment: `prod` (customer onboarding) or `uat` (Tailpipe-internal testing) | _(none — required unless `ENTERPRISE_APP_ID` is set)_ | `prod` |
+| `ENTERPRISE_APP_ID` | Explicit Tailpipe application ID (alternative to `TAILPIPE_ENV`; if both are set they must agree) | _(none)_ | `f5f07900-0484-4506-a34d-ec781138342a` |
 | `MANAGEMENT_GROUP_ID` | Target management group | Auto-detected | `contoso-root` |
 | `BILLING_SCOPE` | Billing profile resource ID | Auto-detected | `/providers/Microsoft.Billing/...` |
 | `STORAGE_SUBID` | Subscription for storage | Auto-detected | `9ea664c2-812d-...` |
@@ -87,13 +94,14 @@ All configuration can be controlled via environment variables:
 
 **Production deployment:**
 ```bash
-ENTERPRISE_APP_ID=f5f07900-0484-4506-a34d-ec781138342a \
+TAILPIPE_ENV=prod \
 LOCATION=uksouth \
 ./setup-tailpipe.sh
 ```
 
-**Test with specific management group:**
+**Test with specific management group (UAT):**
 ```bash
+TAILPIPE_ENV=uat \
 MANAGEMENT_GROUP_ID=my-test-mg \
 LOCATION=westeurope \
 DRY_RUN=1 \
@@ -102,6 +110,7 @@ DRY_RUN=1 \
 
 **Skip automation for simple setups:**
 ```bash
+TAILPIPE_ENV=prod \
 SKIP_AUTOMATION=1 \
 SKIP_POLICY=1 \
 LOCATION=uksouth \
@@ -117,11 +126,11 @@ scoping flags below. This is the recommended configuration when the target
 tenant sits under a wider organisation-wide management group hierarchy.
 
 ```bash
+TAILPIPE_ENV=<prod or uat> \
 TENANT_ID=<tenant-id> \
 SUBS="<sub-1> <sub-2> ..." \
 STORAGE_SUBID=<sub-to-host-storage> \
 LOCATION=uksouth \
-ENTERPRISE_APP_ID=<UAT or PROD app id> \
 MONITORING_SCOPE=subscription \
 SKIP_BILLING_EXPORT=1 \
 SKIP_POLICY=1 \
@@ -334,7 +343,7 @@ az automation job list \
 ```bash
 # Wait 1-2 minutes for Azure AD replication
 # Then re-run the script
-./setup-tailpipe.sh
+TAILPIPE_ENV=prod ./setup-tailpipe.sh
 ```
 
 #### 2. Billing Scope Not Found
@@ -354,7 +363,7 @@ az automation job list \
 **Solution:**
 ```bash
 # Deploy at subscription level instead
-MANAGEMENT_GROUP_ID="" LOCATION=uksouth ./setup-tailpipe.sh
+TAILPIPE_ENV=prod MANAGEMENT_GROUP_ID="" LOCATION=uksouth ./setup-tailpipe.sh
 ```
 
 #### 4. "The content for this response was already consumed"
@@ -367,7 +376,7 @@ MANAGEMENT_GROUP_ID="" LOCATION=uksouth ./setup-tailpipe.sh
 brew update && brew upgrade azure-cli
 
 # Re-run with debug
-DEBUG=1 ./setup-tailpipe.sh
+TAILPIPE_ENV=prod DEBUG=1 ./setup-tailpipe.sh
 ```
 
 #### 5. Export Creation Fails with "Provider not registered"
@@ -381,7 +390,7 @@ az provider register --namespace Microsoft.CostManagement --wait
 az provider register --namespace Microsoft.CostManagementExports --wait
 
 # Re-run setup
-./setup-tailpipe.sh
+TAILPIPE_ENV=prod ./setup-tailpipe.sh
 ```
 
 ### Debug Mode
@@ -389,7 +398,7 @@ az provider register --namespace Microsoft.CostManagementExports --wait
 Enable detailed logging:
 
 ```bash
-DEBUG=1 ./setup-tailpipe.sh
+TAILPIPE_ENV=prod DEBUG=1 ./setup-tailpipe.sh
 ```
 
 This shows full Azure CLI command output for troubleshooting.
@@ -566,7 +575,7 @@ For organizations with multiple Azure tenants:
 # Deploy to each tenant
 for TENANT in tenant1-id tenant2-id tenant3-id; do
   az login --tenant $TENANT
-  TENANT_ID=$TENANT LOCATION=uksouth ./setup-tailpipe.sh
+  TAILPIPE_ENV=prod TENANT_ID=$TENANT LOCATION=uksouth ./setup-tailpipe.sh
 done
 ```
 
@@ -575,7 +584,7 @@ done
 Use a specific subscription for storage:
 
 ```bash
-STORAGE_SUBID=your-sub-id LOCATION=uksouth ./setup-tailpipe.sh
+TAILPIPE_ENV=prod STORAGE_SUBID=your-sub-id LOCATION=uksouth ./setup-tailpipe.sh
 ```
 
 ### Partial Deployment
@@ -583,7 +592,7 @@ STORAGE_SUBID=your-sub-id LOCATION=uksouth ./setup-tailpipe.sh
 Deploy only core infrastructure without automation:
 
 ```bash
-SKIP_AUTOMATION=1 SKIP_POLICY=1 ./setup-tailpipe.sh
+TAILPIPE_ENV=prod SKIP_AUTOMATION=1 SKIP_POLICY=1 ./setup-tailpipe.sh
 ```
 
 ### CI/CD Integration
@@ -644,14 +653,14 @@ Check version:
 head -20 setup-tailpipe.sh | grep VERSION
 ```
 
-Current version: **1.0.0**
+Current version: **1.4.0**
 
 ### Logs
 
 All Azure CLI operations are logged to Azure Activity Log. Enable script debugging:
 
 ```bash
-DEBUG=1 ./setup-tailpipe.sh 2>&1 | tee setup-tailpipe.log
+TAILPIPE_ENV=prod DEBUG=1 ./setup-tailpipe.sh 2>&1 | tee setup-tailpipe.log
 ```
 
 ### Resources
